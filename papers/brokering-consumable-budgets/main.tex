@@ -1,0 +1,227 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\emergencystretch=2em
+\sloppy
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{black!3},
+  columns=fullflexible
+}
+
+\title{\textbf{Brokering Resources You Do Not Understand:}\\
+Consumable LLM Token Budgets in an Unmodified Two-Level Cluster Scheduler}
+
+\author{
+  David Palaitis\\
+  \textit{Medios Lab}\\
+  \texttt{https://github.com/medios-lab/medios-tokens}
+}
+
+\date{November 2026 \quad (\textit{Research Preview Technical Note})}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Autonomous multi-agent LLM workloads are constrained as much by finite external API budgets as by CPUs, memory, or GPUs. Yet today's infrastructure splits these constraints across disconnected layers: cluster schedulers allocate reusable hardware while remaining blind to financial spend, and L7 AI gateways enforce token caps reactively via HTTP~429 errors only after tasks have already been scheduled and partially executed.
+
+We present \texttt{medios-tokens} (a \emph{research preview} reference implementation), an out-of-process HTTP Resource Provider for Medios that introduces \emph{consumable} (\texttt{reserve} $\rightarrow$ \texttt{spend} $\rightarrow$ \texttt{settle} $\rightarrow$ \texttt{refill}) API budget semantics alongside reusable compute resources with \textbf{zero modifications to the Medios broker core}. Whereas our companion hardware module (\texttt{medios-gpu}) demonstrates extending the resource \emph{vocabulary}, \texttt{medios-tokens} tests a stronger hypothesis: extending resource \emph{lifecycle semantics} without modifying the broker. We implement and empirically evaluate two task-level settlement protocols---executor finish hooks (\texttt{TaskInfo.finish}) and ephemeral provider-scoped OpenRouter keys revoked automatically on terminal task states---and demonstrate a live multi-agent contention experiment in which exposing remaining token budget inside resource offers allows a budget-aware scheduler to raise completed workflows from $2/6$ ($0/4$ high-value, $44.0$ units wasted) to $6/6$ ($4/4$ high-value, $0$ wasted) on the exact same unmodified cluster.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+A foundational principle of two-level cluster scheduling, pioneered by Mesos~\cite{hindman2011mesos}, is that a minimal resource broker should manage offers, allocations, and task lifecycles while delegating domain-specific scheduling policy to external frameworks. Medios carries this principle forward under a sharper organizing statement:
+
+\begin{quote}
+\emph{Medios brokers resources it does not need to understand.}
+\end{quote}
+
+The controller does not need to know what an H100 GPU is, how OpenRouter bills for tokens, or how a lab oscilloscope is reserved. To test how far this abstraction stretches in practice, we developed a complementary pair of reference resource extensions:
+
+\begin{itemize}
+  \item \textbf{\texttt{medios-gpu} (hardware provider):} An in-process C++ \texttt{Isolator} module advertising reusable GPU inventory (\texttt{acquire} $\rightarrow$ \texttt{use} $\rightarrow$ \texttt{release}). It demonstrates that the resource \emph{vocabulary} can be extended without changing the broker.
+  \item \textbf{\texttt{medios-tokens} (budget provider, research preview):} An out-of-process Go HTTP \texttt{ResourceProvider} (stdlib-only, zero third-party dependencies, zero C++ coupling) advertising a consumable API token budget (\texttt{reserve} $\rightarrow$ \texttt{spend} $\rightarrow$ \texttt{settle} $\rightarrow$ \texttt{refill}). It tests whether resource \emph{lifecycle semantics} can be extended without changing the broker.
+\end{itemize}
+
+\paragraph{Research preview scope.} Both \texttt{medios-tokens} and the experiments reported in this note are released as a \emph{research preview} designed for single-node, single-provider evaluation and reproducible systems study. We deliberately avoid turning \texttt{medios-tokens} into a general-purpose billing service or distributed multi-node accounting ledger; our goal is to isolate and validate the broker abstraction.
+
+\section{Architecture and Protocol Mechanics}
+\label{sec:arch}
+
+Figure~\ref{fig:arch} illustrates how \texttt{medios-tokens} attaches to an unmodified Medios cluster. Built-in compute scalars (\texttt{cpus}, \texttt{mem}, \texttt{disk}), hardware modules (\texttt{medios-gpu}), and external budget providers (\texttt{medios-tokens}) all converge into the same resource offers delivered to frameworks over \texttt{/api/v1/scheduler}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  node distance=1.0cm and 1.3cm,
+  box/.style={rectangle, draw, rounded corners=2pt, align=center, minimum height=1.0cm, minimum width=2.8cm, font=\small},
+  core/.style={box, fill=black!6, thick, minimum width=3.4cm},
+  arr/.style={-{Stealth[length=2.2mm]}, thick}
+]
+  \node[core] (core) {\textbf{Medios Core (Unchanged)}\\Offers $\cdot$ Allocation $\cdot$ Lifecycle};
+  \node[box, left=of core, yshift=1.1cm] (builtin) {\textbf{Built-in Resources}\\\texttt{cpus}, \texttt{mem}, \texttt{disk}};
+  \node[box, left=of core] (gpu) {\textbf{\texttt{medios-gpu}}\\C++ Isolator\\(Reusable hardware)};
+  \node[box, left=of core, yshift=-1.1cm] (tok) {\textbf{\texttt{medios-tokens}}\\HTTP Resource Provider\\(Consumable budget)};
+  \node[box, right=of core] (fw) {\textbf{Framework / Orchestrator}\\\texttt{/api/v1/scheduler}\\(Domain policy)};
+
+  \draw[arr] (builtin.east) -- (core.west);
+  \draw[arr] (gpu.east) -- (core.west);
+  \draw[arr] (tok.east) -- (core.west);
+  \draw[arr] (core.east) -- node[above, font=\scriptsize] {OFFERS} (fw.west);
+  \draw[arr] (fw.west) to[bend left=18] node[below, font=\scriptsize] {ACCEPT / LAUNCH} (core.east);
+\end{tikzpicture}
+\caption{Three resource classes converging into an unmodified Medios broker. Compute, hardware isolators, and consumable budget providers are co-offered atomically to external schedulers.}
+\label{fig:arch}
+\end{figure}
+
+Table~\ref{tab:pair} contrasts the two reference providers. Notice that the controller requires no accounting concepts: it simply forwards whatever scalar capacity the provider publishes via \texttt{UPDATE\_STATE}.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Dimension} & \textbf{\texttt{medios-gpu}} & \textbf{\texttt{medios-tokens}} \\
+\midrule
+Resource & GPU capacity & API token budget \\
+Source of truth & Host GPU hardware / driver & External API or local ledger \\
+Resource behavior & Reusable & Consumable \\
+Availability model & Device inventory \& allocation & Balance, reservations, refills \\
+Lifecycle & Acquire $\rightarrow$ use $\rightarrow$ release & Reserve $\rightarrow$ spend $\rightarrow$ settle \\
+Extension seam & C++ \texttt{Isolator} (\texttt{--modules}) & HTTP \texttt{ResourceProvider} \\
+Restart safety & Sandbox device UUID checkpoint & Atomic JSON ledger checkpoint \\
+Core modifications & None & None \\
+\bottomrule
+\end{tabular}
+\caption{Reference provider pair illustrating vocabulary extension (\texttt{medios-gpu}) versus lifecycle-semantics extension (\texttt{medios-tokens}).}
+\label{tab:pair}
+\end{table}
+
+\subsection{Empirical Protocol Invariants}
+Implementing a consumable ledger over an unmodified HTTP \texttt{ResourceProvider} stream (\texttt{POST /api/v1/resource\_provider}) surfaced two critical protocol invariants:
+
+\begin{enumerate}
+  \item \textbf{Idempotent admission gating:} \texttt{medios-node} emits \texttt{Event::PUBLISH\_RESOURCES} \emph{twice} per task---once prior to executor launch and again upon executor registration---and does not include \texttt{task\_id} in the event payload. A consumable provider must therefore treat \texttt{PUBLISH\_RESOURCES} strictly as an idempotent authorization gate (\texttt{UPDATE\_PUBLISH\_RESOURCES\_STATUS}), never as a debit counter.
+  \item \textbf{Single-debit accounting via controller events:} To debit each task's reservation exactly once, \texttt{medios-tokens} subscribes to the controller operator stream (\texttt{POST /api/v1} \texttt{SUBSCRIBE}) and debits \texttt{task\_id} on \texttt{TASK\_ADDED}, immediately publishing the reduced balance back to \texttt{medios-node} via \texttt{UPDATE\_STATE}. Because the ledger checkpoints \texttt{provider\_id}, current balance, and per-task entries atomically via write-and-rename, provider restarts preserve deduplication and balance integrity.
+\end{enumerate}
+
+\section{Task-Level Settlement Protocols}
+\label{sec:settle}
+
+A consumable reservation locks a task's worst-case ceiling at launch. Because actual LLM spend is frequently lower than worst-case bounds, releasing unused credit (\texttt{reserved} $-$ \texttt{actual}) promptly is essential for cluster utilization. We implement two complementary task-level settlement patterns and explicitly reject a third.
+
+\subsection{Pattern 1: Executor Finish Hook Settlement}
+Medios supports a bounded post-exit hook (\texttt{TaskInfo.finish}) executed by the command executor in the task's sandbox after the work command exits---whether due to normal completion, non-zero exit, or framework kill. Under Pattern~1:
+\begin{enumerate}
+  \item The task records actual spend (e.g., from OpenRouter's \texttt{/api/v1/generation?id=...} endpoint or token counts) to \texttt{./usage.json}.
+  \item The finish hook reads the executor-injected \texttt{MEDIOS\_TASK\_ID} and \texttt{./usage.json}, posting \texttt{\{"task\_id", "actual"\}} to \texttt{medios-tokens} (\texttt{POST /settle}).
+  \item \textbf{Fail-closed semantics:} If the task crashes before writing \texttt{./usage.json} or writes malformed data, the hook refuses to settle, leaving the full reservation debited so unverified capacity is never refunded.
+\end{enumerate}
+
+\subsection{Pattern 2: Per-Task Scoped Provider Keys}
+Pattern~1 relies on cooperative reporting and cannot prevent a runaway loop from overspending a shared API key. Pattern~2 moves hard enforcement to the upstream provider edge via a pluggable \texttt{Provisioner} interface and a stdlib-only OpenRouter Management API adapter:
+\begin{enumerate}
+  \item Before launching \texttt{task\_id}, the framework calls \texttt{POST /provision} with \texttt{\{"task\_id", "limit"\}}.
+  \item \texttt{medios-tokens} mints an ephemeral, hard-capped key (\texttt{POST /api/v1/keys}), returns the raw secret \emph{once} to the caller for injection into the task environment, and checkpoints \textbf{only} the opaque \texttt{key\_hash} in the ledger. Raw secrets never touch disk.
+  \item When the controller emits any terminal \texttt{TASK\_UPDATED} event (\texttt{TASK\_FINISHED}, \texttt{TASK\_FAILED}, \texttt{TASK\_KILLED}, \texttt{TASK\_LOST}, etc.), \texttt{medios-tokens} automatically reads exact spend (\texttt{GET /api/v1/keys/\{hash\}}), revokes the key (\texttt{DELETE /api/v1/keys/\{hash\}}), settles the ledger, and publishes updated capacity via \texttt{UPDATE\_STATE}.
+\end{enumerate}
+
+\subsection{Why We Reject Account-Level Treasury Polling}
+A tempting alternative is polling the upstream provider's account-level credit balance periodically and republishing it as \texttt{UPDATE\_STATE}. We classify this as a separate treasury-reconciliation problem and deliberately exclude it: upstream billing lag (seconds to minutes) causes an account poller to re-advertise balance already committed to in-flight tasks, silently violating the hard spend ceiling. Task-scoped settlement avoids double-advertising by construction.
+
+\section{Experimental Evaluation}
+\label{sec:eval}
+
+All experiments were executed live on macOS (Apple Silicon) against freshly compiled, unmodified \texttt{medios-controller}, \texttt{medios-node}, and \texttt{medios-executor} binaries alongside the compiled Go \texttt{medios-tokens} binary.
+
+\subsection{Experiment 1: Finish-Hook Fail-Closed Verification}
+Using \texttt{examples/finish-hook-settle/smoke.py} on a cluster initialized with \texttt{token\_budget=100}, we executed three consecutive tasks each reserving $25$ units:
+\begin{enumerate}
+  \item \textbf{Exit-0 normal settle:} Spent $18$; hook released $+7$; subsequent offer advertised \texttt{token\_budget=82.0}.
+  \item \textbf{Exit-1 failure settle:} Exited non-zero after spending $10$; finish hook still ran and released $+15$; subsequent offer advertised \texttt{token\_budget=72.0}.
+  \item \textbf{Crash / missing usage (fail-closed):} Exited without writing \texttt{./usage.json}; hook declined to refund; subsequent offer advertised \texttt{token\_budget=47.0}.
+\end{enumerate}
+
+\subsection{Experiment 2: Live OpenRouter Scoped-Key Lifecycle}
+Using a real OpenRouter Management API key stored in Google Secret Manager (loaded into \texttt{OPENROUTER\_PROVISIONING\_KEY} at runtime), we exercised Pattern~2 end-to-end against \texttt{https://openrouter.ai}:
+\begin{itemize}
+  \item \texttt{POST /provision} minted a live $\$0.05$-capped key (\texttt{hash\_prefix=8d6fe40e513d}); inspecting the checkpoint file on disk confirmed \texttt{key\_hash} was persisted while the raw secret was absent.
+  \item A live \texttt{openai/gpt-4o-mini} completion succeeded using the minted key.
+  \item Upon \texttt{TASK\_FINISHED}, \texttt{medios-tokens} automatically queried key usage, invoked \texttt{DELETE /api/v1/keys/\{hash\}}, and published \texttt{UPDATE\_STATE} restoring unused budget ($1.00 \rightarrow 0.95 \rightarrow 1.00$).
+  \item A post-run query to \texttt{GET /api/v1/keys} confirmed zero \texttt{medios-*} keys remained in the account.
+\end{itemize}
+\paragraph{Empirical observation on upstream lag.} For a sub-second micro-completion costing a few millionths of a dollar, OpenRouter's per-key usage counter and edge deletion cache exhibited a $\sim 2\text{--}3$\,s propagation delay. Multi-second agent runs settle accurately; sub-second tasks motivate a small configurable pre-settle grace delay in future revisions.
+
+\subsection{Experiment 3: Multi-Agent Contention vs.\ Orchestration}
+To test the two-level scheduling thesis under contention, we ran six multi-agent workflows against a shared $100$-unit \texttt{token\_budget} pool (\texttt{examples/multi-agent-budget/benchmark.py}):
+\begin{itemize}
+  \item \textbf{4 high-value 3-step research chains} (\texttt{plan}: $5$, \texttt{gather}: $8$, \texttt{synthesize}: $7$; $20$ units per chain, $80$ total). Partial chains have zero utility if step~3 cannot run.
+  \item \textbf{2 low-value background digests} ($18$ units on a standard model, or $6$ units on a cheap model tier).
+\end{itemize}
+We compared two schedulers over the \textbf{exact same unmodified broker and \texttt{medios-tokens} provider}:
+\begin{enumerate}
+  \item \textbf{Case 1 (Naive FIFO Queue):} Interleaved FIFO queue reserving a blanket worst-case $25$ units per step, with no chain admission or model routing.
+  \item \textbf{Case 2 (Smart Budget Orchestrator):} Full-chain admission before starting step~1, tight per-step reservations ($8, 10, 9$) with immediate settlement recycling, and watermark-driven model routing (below $25$ remaining units, background digests downgrade to the $6$-unit model tier).
+\end{enumerate}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Metric} & \textbf{Case 1: Naive FIFO Queue} & \textbf{Case 2: Smart Orchestrator} \\
+\midrule
+Starting \texttt{token\_budget} & $100.0$ & $100.0$ \\
+High-value workflows (3-step) & $0 / 4$ & $\mathbf{4 / 4}$ \\
+Low-value background digests & $2 / 2$ & $\mathbf{2 / 2}$ \\
+Total workflows completed & $2 / 6$ & $\mathbf{6 / 6}$ \\
+Budget wasted on stranded work & $44.0$ & $\mathbf{0.0}$ \\
+Remaining \texttt{token\_budget} & $20.0$ (fragmented $< 25$) & $8.0$ \\
+Wall-clock time (live cluster) & $8.89$\,s & $\mathbf{8.35}$\,s \\
+Changes to broker / provider & None & None \\
+\bottomrule
+\end{tabular}
+\caption{Live side-by-side multi-agent benchmark on two fresh Medios clusters with \texttt{medios-tokens}.}
+\label{tab:bench}
+\end{table}
+
+Table~\ref{tab:bench} summarizes the live results. In Case~1, \texttt{medios-tokens} prevented overspend, but priority inversion and reservation fragmentation stranded all four research chains at step~2/3, wasting $44.0$ units while leaving $20.0$ units unusable below the blanket $25$-unit reservation. In Case~2, reading the live \texttt{token\_budget} directly from incoming \texttt{OFFERS} enabled the orchestrator to complete all $6/6$ workflows with zero wasted spend and faster wall-clock completion ($8.35$\,s vs.\ $8.89$\,s).
+
+\section{Related Work}
+\label{sec:related}
+
+Existing work on LLM budget control and agent resource management largely operates at four layers distinct from a two-level cluster resource broker:
+
+\begin{itemize}
+  \item \textbf{L7 AI gateways:} Systems such as LiteLLM, Portkey, and Envoy AI Gateway enforce virtual keys and token-bucket rate limits on the HTTP data plane, returning HTTP~429 once a cap is hit. Because the cluster scheduler is blind to gateway budgets, workflows still acquire compute and burn partial steps before failing mid-flight.
+  \item \textbf{Algorithmic multi-agent budget planners:} BAMAS~\cite{yang2025bamas}, ZEBRA~\cite{hamri2026zebra}, and BudgetThinker~\cite{budgetthinker2025} optimize how to allocate a fixed budget across agent topologies, pipeline phases, or reasoning tokens. These are scheduling \emph{policies} that map naturally onto Medios frameworks consuming live \texttt{token\_budget} offers.
+  \item \textbf{Language-level budget enforcement:} Recent empirical analysis of 63 production LLM-agent budget overruns~\cite{tokenbudgets2026} proposes affine Rust types to prevent single-process retry loops from bypassing caps. Our approach operates at the cluster boundary across heterogeneous languages and containers.
+  \item \textbf{Agent OS and cluster managers:} AIOS~\cite{mei2024aios}, AgentCgroup~\cite{agentcgroup2025}, Kubernetes Extended Resources, Ray custom resources, and Slurm GRES/TRES manage reusable hardware slots or post-hoc compute accounting rather than real-time consumable financial ledgers with task-scoped settlement.
+\end{itemize}
+
+\section{Limitations and Future Work}
+\label{sec:limits}
+
+As a research preview, \texttt{medios-tokens} intentionally scopes out several open problems: (1)~multi-node distributed budget consensus across multiple providers (currently one provider on one node); (2)~configurable settle-delay buffers to absorb sub-second upstream billing lag; and (3)~additional \texttt{Provisioner} backends such as OpenBao dynamic leased credentials. None of these require changing the Medios broker core.
+
+\section{Reproducibility}
+All source code, unit tests (\texttt{go test -race ./...}), the finish-hook smoke harness (\path{examples/finish-hook-settle/smoke.py}), and the live multi-agent benchmark (\path{examples/multi-agent-budget/benchmark.py}) are publicly available at \url{https://github.com/medios-lab/medios-tokens} under the Apache~2.0 license.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

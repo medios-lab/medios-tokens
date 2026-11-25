@@ -1,6 +1,10 @@
 # medios-tokens
 
+> **Status: Research Preview.** `medios-tokens` is an experimental reference implementation demonstrating consumable budget semantics on an unmodified Medios broker. It is scoped to a single provider on a single node for reproducible systems research and is not a production billing service.
+
 Reference HTTP Resource Provider for consumable API token budgets on [Medios](https://github.com/medios-lab/medios).
+
+**Technical Note (PDF):** [Brokering Resources You Do Not Understand: Consumable LLM Token Budgets in an Unmodified Two-Level Cluster Scheduler](papers/brokering-consumable-budgets/main.pdf) ([LaTeX source](papers/brokering-consumable-budgets/main.tex)).
 
 **Organizing principle:** Medios brokers resources it does not need to understand. `medios-gpu` shows you can extend the resource vocabulary with reusable hardware (`acquire -> use -> release`) without modifying Medios core; `medios-tokens` shows you can extend resource lifecycle semantics to consumable budgets (`reserve -> spend -> settle`) with zero core modifications and zero C++ coupling.
 
