@@ -18,6 +18,7 @@ import (
 
 	"github.com/medios-lab/medios-tokens/internal/ledger"
 	"github.com/medios-lab/medios-tokens/internal/provider"
+	"github.com/medios-lab/medios-tokens/internal/provisioner"
 )
 
 func main() {
@@ -30,7 +31,9 @@ func main() {
 	refillAmount := flag.Float64("refill-amount", 40.0, "Amount added on each refill trigger (SIGUSR1, timer, or /refill)")
 	refillInterval := flag.Duration("refill-interval", 0, "Periodic refill interval (0 disables timer; use SIGUSR1 or /refill)")
 	stateFile := flag.String("state-file", "", "Optional JSON ledger checkpoint path for restart durability")
-	adminAddr := flag.String("admin-addr", "", "Optional local HTTP listen address for /balance, /settle, and /refill (e.g. 127.0.0.1:9095)")
+	adminAddr := flag.String("admin-addr", "", "Optional local HTTP listen address for /balance, /settle, /refill, and /provision (e.g. 127.0.0.1:9095)")
+	openRouterKeyEnv := flag.String("openrouter-provisioning-key-env", "OPENROUTER_PROVISIONING_KEY", "Environment variable holding an OpenRouter provisioning key for per-task scoped key minting and terminal settlement")
+	openRouterBaseURL := flag.String("openrouter-base-url", provisioner.DefaultOpenRouterBaseURL, "OpenRouter API base URL for key provisioning")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "[medios-tokens] ", log.LstdFlags)
@@ -38,6 +41,18 @@ func main() {
 	l, err := ledger.Open(*stateFile, *resourceName, *initial, *capVal)
 	if err != nil {
 		logger.Fatalf("failed to open ledger: %v", err)
+	}
+
+	var prov provisioner.Provisioner
+	if *openRouterKeyEnv != "" {
+		if rawKey := os.Getenv(*openRouterKeyEnv); rawKey != "" {
+			orProv, err := provisioner.NewOpenRouter(rawKey, *openRouterBaseURL, nil)
+			if err != nil {
+				logger.Fatalf("failed to initialize OpenRouter provisioner: %v", err)
+			}
+			prov = orProv
+			logger.Printf("OpenRouter per-task key provisioning enabled via $%s", *openRouterKeyEnv)
+		}
 	}
 
 	p := provider.New(provider.Config{
@@ -48,6 +63,7 @@ func main() {
 		RefillAmount:   *refillAmount,
 		RefillInterval: *refillInterval,
 		AdminAddr:      *adminAddr,
+		Provisioner:    prov,
 	}, l, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -56,7 +72,7 @@ func main() {
 	if *adminAddr != "" {
 		srv := &http.Server{Addr: *adminAddr, Handler: p.AdminHandler()}
 		go func() {
-			logger.Printf("admin HTTP listening on http://%s (/balance, /settle, /refill)", *adminAddr)
+			logger.Printf("admin HTTP listening on http://%s (/balance, /settle, /refill, /provision)", *adminAddr)
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				logger.Printf("admin HTTP error: %v", err)
 			}

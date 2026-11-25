@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/medios-lab/medios-tokens/internal/ledger"
+	"github.com/medios-lab/medios-tokens/internal/provisioner"
 	"github.com/medios-lab/medios-tokens/internal/recordio"
 )
 
@@ -33,6 +34,7 @@ type Config struct {
 	RefillAmount   float64
 	RefillInterval time.Duration
 	AdminAddr      string
+	Provisioner    provisioner.Provisioner
 }
 
 type Provider struct {
@@ -103,6 +105,23 @@ type ctrlEvent struct {
 			} `json:"resources"`
 		} `json:"task"`
 	} `json:"task_added"`
+	TaskUpdated *struct {
+		State  string `json:"state"`
+		Status *struct {
+			TaskID idVal  `json:"task_id"`
+			State  string `json:"state"`
+		} `json:"status"`
+	} `json:"task_updated"`
+}
+
+func isTerminalTaskState(state string) bool {
+	switch state {
+	case "TASK_FINISHED", "TASK_FAILED", "TASK_KILLED", "TASK_LOST",
+		"TASK_GONE", "TASK_GONE_BY_OPERATOR", "TASK_ERROR", "TASK_DROPPED":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Provider) postJSON(ctx context.Context, url string, payload any, streamID string) (int, string, error) {
@@ -255,6 +274,40 @@ func (p *Provider) AdminHandler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"balance": bal})
 	})
+	mux.HandleFunc("/provision", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if p.cfg.Provisioner == nil {
+			http.Error(w, "key provisioning is not configured", http.StatusNotImplemented)
+			return
+		}
+		var req struct {
+			TaskID string  `json:"task_id"`
+			Limit  float64 `json:"limit"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TaskID == "" || req.Limit <= 0 {
+			http.Error(w, "expecting JSON {\"task_id\": \"...\", \"limit\": <positive-number>}", http.StatusBadRequest)
+			return
+		}
+		grant, err := p.cfg.Provisioner.Provision(r.Context(), req.TaskID, req.Limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if err := p.ledger.RecordKeyHash(req.TaskID, grant.Hash); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"task_id":  req.TaskID,
+			"key_hash": grant.Hash,
+			"key":      grant.Secret,
+			"limit":    grant.Limit,
+		})
+	})
 	return mux
 }
 
@@ -284,30 +337,61 @@ func (p *Provider) watchController(ctx context.Context) error {
 		if err := reader.Next(&ev); err != nil {
 			return err
 		}
-		if ev.Type != "TASK_ADDED" || ev.TaskAdded == nil {
-			continue
-		}
-		taskID := ev.TaskAdded.Task.TaskID.Value
-		pid := p.ledger.ProviderID()
-		var spent float64
-		for _, res := range ev.TaskAdded.Task.Resources {
-			if res.Name == p.cfg.ResourceName && res.Type == "SCALAR" &&
-				res.ProviderID != nil && res.ProviderID.Value == pid && res.Scalar != nil {
-				spent += res.Scalar.Value
+		switch ev.Type {
+		case "TASK_ADDED":
+			if ev.TaskAdded == nil {
+				continue
 			}
-		}
-		if spent <= 0 {
-			continue
-		}
-		_, changed, err := p.ledger.DebitTask(taskID, spent)
-		if err != nil {
-			p.logger.Printf("debit error for task %s: %v", taskID, err)
-			continue
-		}
-		if changed {
-			if err := p.Advertise(ctx, fmt.Sprintf("debited %.6g for task %s", spent, taskID)); err != nil {
-				p.logger.Printf("advertise error after debit %s: %v", taskID, err)
+			taskID := ev.TaskAdded.Task.TaskID.Value
+			pid := p.ledger.ProviderID()
+			var spent float64
+			for _, res := range ev.TaskAdded.Task.Resources {
+				if res.Name == p.cfg.ResourceName && res.Type == "SCALAR" &&
+					res.ProviderID != nil && res.ProviderID.Value == pid && res.Scalar != nil {
+					spent += res.Scalar.Value
+				}
 			}
+			if spent <= 0 {
+				continue
+			}
+			_, changed, err := p.ledger.DebitTask(taskID, spent)
+			if err != nil {
+				p.logger.Printf("debit error for task %s: %v", taskID, err)
+				continue
+			}
+			if changed {
+				if err := p.Advertise(ctx, fmt.Sprintf("debited %.6g for task %s", spent, taskID)); err != nil {
+					p.logger.Printf("advertise error after debit %s: %v", taskID, err)
+				}
+			}
+
+		case "TASK_UPDATED":
+			if ev.TaskUpdated == nil || ev.TaskUpdated.Status == nil || p.cfg.Provisioner == nil {
+				continue
+			}
+			taskID := ev.TaskUpdated.Status.TaskID.Value
+			state := ev.TaskUpdated.State
+			if state == "" {
+				state = ev.TaskUpdated.Status.State
+			}
+			if taskID == "" || !isTerminalTaskState(state) {
+				continue
+			}
+			keyHash, settled, ok := p.ledger.TaskKeyHash(taskID)
+			if !ok || settled {
+				continue
+			}
+			actual, err := p.cfg.Provisioner.SettleAndRevoke(ctx, taskID, keyHash)
+			if err != nil {
+				p.logger.Printf("provisioner settle/revoke failed for task %s (%s): %v", taskID, state, err)
+				continue
+			}
+			delta, bal, err := p.Settle(ctx, taskID, actual)
+			if err != nil {
+				p.logger.Printf("ledger settle failed for task %s: %v", taskID, err)
+				continue
+			}
+			p.logger.Printf("auto-settled provisioned task %s on %s actual=%.6g delta=%+.6g balance=%.6g", taskID, state, actual, delta, bal)
 		}
 	}
 }

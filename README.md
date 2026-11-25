@@ -63,6 +63,29 @@ curl -s -X POST http://127.0.0.1:9095/refill \
   -d '{"amount":40}'
 ```
 
+## Per-task scoped keys for OpenRouter (Pattern 2)
+
+For stronger enforcement than task-reported settlement, set `OPENROUTER_PROVISIONING_KEY` (or pass `--openrouter-provisioning-key-env`):
+
+```sh
+export OPENROUTER_PROVISIONING_KEY="sk-or-v1-..."
+./medios-tokens \
+  --controller=http://127.0.0.1:5050 \
+  --node=http://127.0.0.1:5051 \
+  --state-file=/tmp/medios-tokens.state.json \
+  --admin-addr=127.0.0.1:9095
+```
+
+Before launching a task, a scheduler mints a hard-capped ephemeral key for that `task_id`:
+
+```sh
+curl -s -X POST http://127.0.0.1:9095/provision \
+  -H 'Content-Type: application/json' \
+  -d '{"task_id":"task-1","limit":25}'
+```
+
+`medios-tokens` returns the secret key once (for injection into the task environment) and checkpoints only the opaque `key_hash` in its ledger. When the controller emits a terminal `TASK_UPDATED` event (`TASK_FINISHED`, `TASK_FAILED`, `TASK_KILLED`, `TASK_LOST`, etc.), `medios-tokens` automatically reads exact spend from OpenRouter (`GET /api/v1/keys/{hash}`), revokes the key (`DELETE /api/v1/keys/{hash}`), and returns unused credit to Medios offers via `UPDATE_STATE`.
+
 ## Worked examples
 
 - [examples/finish-hook-settle](examples/finish-hook-settle/README.md): end-to-end Task Finish Hook settlement (Pattern 1) showing a task writing actual LLM spend to `./usage.json`, a finish hook posting to `POST /settle`, fail-closed semantics on missing usage, and a live smoke test against `medios-controller` and `medios-node`.

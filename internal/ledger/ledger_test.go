@@ -63,3 +63,42 @@ func TestLedgerReserveSettleRefillAndCheckpoint(t *testing.T) {
 		t.Fatalf("post-restart duplicate debit = (%v, %v), want (40, false)", bal, changed)
 	}
 }
+
+func TestLedgerRecordKeyHashAndCheckpoint(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "ledger.json")
+
+	l, err := Open(stateFile, "token_budget", 100, 100)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// Pattern 2 provisions a scoped key before TASK_ADDED arrives.
+	if err := l.RecordKeyHash("task-prov", "or-hash-123"); err != nil {
+		t.Fatalf("RecordKeyHash: %v", err)
+	}
+	bal, changed, err := l.DebitTask("task-prov", 25)
+	if err != nil || !changed || bal != 75 {
+		t.Fatalf("DebitTask after RecordKeyHash = (%v, %v, %v), want (75, true, nil)", bal, changed, err)
+	}
+	if bal, changed, err := l.DebitTask("task-prov", 25); err != nil || changed || bal != 75 {
+		t.Fatalf("duplicate DebitTask = (%v, %v, %v), want (75, false, nil)", bal, changed, err)
+	}
+
+	reopened, err := Open(stateFile, "token_budget", 100, 100)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	hash, settled, ok := reopened.TaskKeyHash("task-prov")
+	if !ok || settled || hash != "or-hash-123" {
+		t.Fatalf("TaskKeyHash after restart = (%q, %v, %v), want (or-hash-123, false, true)", hash, settled, ok)
+	}
+
+	delta, bal, err := reopened.SettleTask("task-prov", 10)
+	if err != nil || delta != 15 || bal != 90 {
+		t.Fatalf("SettleTask = (%v, %v, %v), want (15, 90, nil)", delta, bal, err)
+	}
+	hash, settled, ok = reopened.TaskKeyHash("task-prov")
+	if !ok || !settled || hash != "or-hash-123" {
+		t.Fatalf("TaskKeyHash after settle = (%q, %v, %v), want (or-hash-123, true, true)", hash, settled, ok)
+	}
+}

@@ -17,10 +17,12 @@ import (
 )
 
 // TaskEntry records one task's reserved and settled consumable amount.
+// KeyHash is an optional opaque provider key identifier (never a raw secret).
 type TaskEntry struct {
 	Reserved float64 `json:"reserved"`
 	Settled  bool    `json:"settled"`
 	Actual   float64 `json:"actual,omitempty"`
+	KeyHash  string  `json:"key_hash,omitempty"`
 }
 
 // Snapshot is the serializable checkpoint of the provider's budget ledger.
@@ -147,6 +149,31 @@ func (l *Ledger) CanAuthorize() bool {
 	return !l.snap.Frozen
 }
 
+// RecordKeyHash associates an opaque provisioned key handle (never a raw secret)
+// with taskID and checkpoints the ledger atomically.
+func (l *Ledger) RecordKeyHash(taskID, keyHash string) error {
+	if taskID == "" || keyHash == "" {
+		return errors.New("task_id and key_hash are required")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.snap.Tasks[taskID]
+	entry.KeyHash = keyHash
+	l.snap.Tasks[taskID] = entry
+	return l.persistLocked()
+}
+
+// TaskKeyHash returns the recorded key hash and settlement state for taskID.
+func (l *Ledger) TaskKeyHash(taskID string) (keyHash string, settled bool, ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry, exists := l.snap.Tasks[taskID]
+	if !exists || entry.KeyHash == "" {
+		return "", false, false
+	}
+	return entry.KeyHash, entry.Settled, true
+}
+
 // DebitTask records a task's reserved spend exactly once per unique taskID.
 // Returns (balanceAfter, changed, err).
 func (l *Ledger) DebitTask(taskID string, amount float64) (float64, bool, error) {
@@ -155,10 +182,12 @@ func (l *Ledger) DebitTask(taskID string, amount float64) (float64, bool, error)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if _, exists := l.snap.Tasks[taskID]; exists {
+	entry, exists := l.snap.Tasks[taskID]
+	if exists && entry.Reserved > 0 {
 		return l.snap.Balance, false, nil
 	}
-	l.snap.Tasks[taskID] = TaskEntry{Reserved: round6(amount)}
+	entry.Reserved = round6(amount)
+	l.snap.Tasks[taskID] = entry
 	next := round6(l.snap.Balance - amount)
 	if next < 0 {
 		next = 0
