@@ -1,0 +1,32 @@
+{
+  "name": "openrouter-finish-hook-demo",
+  "task_id": {"value": "openrouter-task-1"},
+  "node_id": {"value": "<node-id>"},
+  "principal": "operator:alice",
+  "resources": [
+    {"name": "cpus", "type": "SCALAR", "scalar": {"value": 0.2}},
+    {"name": "mem", "type": "SCALAR", "scalar": {"value": 128}},
+    {
+      "name": "token_budget",
+      "type": "SCALAR",
+      "scalar": {"value": 25.0},
+      "provider_id": {"value": "<provider-id>"}
+    }
+  ],
+  "command": {
+    "shell": true,
+    "value": "./work.sh --fake-spend 18"
+  },
+  "finish": {
+    "command": {
+      "shell": true,
+      "value": "./settle-hook.sh",
+      "environment": {
+        "variables": [
+          {"name": "MEDIOS_TOKENS_ADMIN_URL", "value": "http://127.0.0.1:9095"}
+        ]
+      }
+    },
+    "cap": {"nanoseconds": 15000000000}
+  }
+}

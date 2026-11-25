@@ -63,6 +63,10 @@ curl -s -X POST http://127.0.0.1:9095/refill \
   -d '{"amount":40}'
 ```
 
+## Worked examples
+
+- [examples/finish-hook-settle](examples/finish-hook-settle/README.md): end-to-end Task Finish Hook settlement (Pattern 1) showing a task writing actual LLM spend to `./usage.json`, a finish hook posting to `POST /settle`, fail-closed semantics on missing usage, and a live smoke test against `medios-controller` and `medios-node`.
+
 ## License
 
 Apache License, Version 2.0. See [LICENSE](LICENSE).
