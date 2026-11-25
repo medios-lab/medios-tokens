@@ -89,6 +89,7 @@ curl -s -X POST http://127.0.0.1:9095/provision \
 ## Worked examples
 
 - [examples/finish-hook-settle](examples/finish-hook-settle/README.md): end-to-end Task Finish Hook settlement (Pattern 1) showing a task writing actual LLM spend to `./usage.json`, a finish hook posting to `POST /settle`, fail-closed semantics on missing usage, and a live smoke test against `medios-controller` and `medios-node`.
+- [examples/multi-agent-budget](examples/multi-agent-budget/README.md): live side-by-side benchmark comparing naive FIFO queue contention against a budget-aware multi-agent orchestrator sharing one `100`-unit `token_budget` pool.
 
 ## License
 
