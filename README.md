@@ -4,7 +4,7 @@
 
 Reference HTTP Resource Provider for consumable API token budgets on [Medios](https://github.com/medios-lab/medios).
 
-**Technical Note (PDF):** [Brokering Resources You Do Not Understand: Consumable LLM Token Budgets in an Unmodified Two-Level Cluster Scheduler](papers/brokering-consumable-budgets/main.pdf) ([LaTeX source](papers/brokering-consumable-budgets/main.tex)).
+**Technical Note (PDF):** [Consumable API Token Budgets in an Unmodified Two-Level Resource Broker](papers/brokering-consumable-budgets/main.pdf) ([LaTeX source](papers/brokering-consumable-budgets/main.tex)).
 
 **Organizing principle:** Medios brokers resources it does not need to understand. `medios-gpu` shows you can extend the resource vocabulary with reusable hardware (`acquire -> use -> release`) without modifying Medios core; `medios-tokens` shows you can extend resource lifecycle semantics to consumable budgets (`reserve -> spend -> settle`) with zero core modifications and zero C++ coupling.
 

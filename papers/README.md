@@ -4,7 +4,7 @@ Research notes and arXiv-style technical reports accompanying `medios-tokens` (r
 
 | Paper | Source | PDF |
 | --- | --- | --- |
-| **Brokering Resources You Do Not Understand: Consumable LLM Token Budgets in an Unmodified Two-Level Cluster Scheduler** (Nov 2026) | [`main.tex`](brokering-consumable-budgets/main.tex) | [`main.pdf`](brokering-consumable-budgets/main.pdf) |
+| **Consumable API Token Budgets in an Unmodified Two-Level Resource Broker** (Nov 2026) | [`main.tex`](brokering-consumable-budgets/main.tex) | [`main.pdf`](brokering-consumable-budgets/main.pdf) |
 
 ## Rebuilding the PDF
 
