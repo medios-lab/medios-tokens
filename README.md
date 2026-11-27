@@ -10,7 +10,7 @@ Reference HTTP Resource Provider for consumable API token budgets on [Medios](ht
 
 ## What it does
 
-1. Reads an externally governed budget (`--initial`, `--cap`, or durable `--state-file` checkpoint).
+1. Reads one or more externally governed budgets (`--initial` and `--cap`, a `--config` file of named pools, an HTTP balance endpoint per pool, or a durable `--state-file` checkpoint).
 2. Advertises available capacity to a `medios-node` over `POST /api/v1/resource_provider` (`UPDATE_STATE`).
 3. Authorizes task launch reservations (`Event::PUBLISH_RESOURCES` -> `UPDATE_PUBLISH_RESOURCES_STATUS`).
 4. Debits each accepted task once per `task_id` via controller `/api/v1` `TASK_ADDED` events, and optionally reconciles actual consumption (`POST /settle`) to release unused capacity back into the pool.
@@ -66,6 +66,88 @@ curl -s -X POST http://127.0.0.1:9095/refill \
   -H 'Content-Type: application/json' \
   -d '{"amount":40}'
 ```
+
+## Several pools from one provider
+
+`--config` replaces `--resource`, `--initial`, `--cap` and `--refill-amount` with a JSON file that declares any number of named pools. Each pool is advertised as its own scalar resource in the same `UPDATE_STATE`, and a task that carries several of them is debited from all of them in one ledger update.
+
+```json
+{
+  "pools": [
+    {
+      "resource": "tauopt_suggestions",
+      "initial": 1000,
+      "cap": 1000,
+      "sync": {
+        "url": "https://api.tauopt.com/v1/me",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+        "auth_env": "TAUOPT_API_TOKEN",
+        "interval": "60s",
+        "cap_path": "org.caps.org.suggests_per_day",
+        "used_path": "org.usage.suggests_24h"
+      }
+    },
+    {
+      "resource": "openrouter_usd",
+      "initial": 50.0,
+      "cap": 50.0,
+      "refill_amount": 0,
+      "provisioner": "openrouter"
+    }
+  ]
+}
+```
+
+```sh
+export TAUOPT_API_TOKEN="..."
+export OPENROUTER_PROVISIONING_KEY="sk-or-v1-..."
+./medios-tokens \
+  --controller=http://127.0.0.1:5050 \
+  --node=http://127.0.0.1:5051 \
+  --config=pools.json \
+  --state-file=/tmp/medios-tokens.state.json \
+  --admin-addr=127.0.0.1:9095
+```
+
+Pool fields:
+
+| Field | Meaning |
+| --- | --- |
+| `resource` | Scalar resource name advertised to Medios. Required and unique. |
+| `initial`, `cap` | Balance and cap the pool starts with when the state file does not already hold it. |
+| `refill_amount` | Amount added on `SIGUSR1`, on the `--refill-interval` timer, and on `POST /refill` without an amount. `0` or omitted leaves the pool alone on those triggers. Not allowed together with `sync`. |
+| `provisioner` | `"openrouter"` binds per-task key provisioning (below) to this pool. At most one pool may set it, and the provisioning key variable must then be set. |
+| `sync` | Makes the pool's balance follow an HTTP JSON endpoint. |
+
+With more than one pool, `POST /settle` and `POST /refill` require a `"resource"` field naming the pool; with one pool the field is optional. `GET /balance` returns every pool under `pools`, and with one pool it also returns that pool's `resource`, `balance`, `cap` and `tasks` at the top level.
+
+A state file written by a single-pool run loads under `--config` when the config declares the same resource name; pools the file does not hold are added from the config. A state file that holds a pool the config does not declare stops startup with an error.
+
+### Balance sync from an HTTP endpoint
+
+A pool with a `sync` block is read once before the provider subscribes and then every `interval`. Each read is one `GET` of `url`; the balance is taken from the JSON response by dot-separated object keys.
+
+| Field | Meaning |
+| --- | --- |
+| `url` | Absolute `http` or `https` URL. Redirects are not followed. |
+| `cap_path`, `used_path` | Paths to the external cap and the amount used; available = cap - used. |
+| `remaining_path` | Path to the amount remaining, used instead of `used_path`. `cap_path` is then optional. |
+| `auth_header`, `auth_prefix`, `auth_env` | The request carries `<auth_header>: <auth_prefix><value of $auth_env>`. Omit all three for an endpoint without authentication. If `auth_env` is named and the variable is unset or empty, startup fails. |
+| `interval` | Time between reads, as a Go duration. Default `60s`. |
+| `timeout` | Limit for one read. Default `10s`. |
+
+After each read the pool's cap becomes the external cap and its balance becomes
+
+```
+max(0, external available - reservations of tasks not yet settled)
+```
+
+so capacity already promised to running tasks is not offered a second time. Until a task settles, its full reservation is subtracted even if the endpoint already counts part of its spend, which makes the advertised balance lower than the true one for that period and never higher.
+
+When a read fails (connection error, timeout, a status other than 200, or a response without the configured paths), the provider logs the failure and keeps advertising the last balance. There is no limit on how long it does so. The credential value is never written to the log or the state file.
+
+`POST /refill` on a synced pool returns HTTP 409.
 
 ## Per-task scoped keys for OpenRouter (Pattern 2)
 
