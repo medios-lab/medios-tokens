@@ -330,6 +330,27 @@ func TestNewRejectsInconsistentConfig(t *testing.T) {
 	}
 }
 
+func TestProvisionRecordsKeyHashInBoundPool(t *testing.T) {
+	l := twoPoolLedger(t)
+	p, err := New(Config{Provisioner: &fakeProvisioner{}, ProvisionerResource: usd}, l, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &harness{t: t, p: p, admin: httptest.NewServer(p.AdminHandler())}
+	defer h.admin.Close()
+
+	code, body := h.post("/provision", `{"task_id":"task-k","limit":2}`)
+	if code != http.StatusOK || body["resource"] != usd || body["key_hash"] != "hash-task-k" {
+		t.Fatalf("/provision = HTTP %d %v", code, body)
+	}
+	if hash, settled, ok := l.TaskKeyHash(usd, "task-k"); !ok || settled || hash != "hash-task-k" {
+		t.Fatalf("TaskKeyHash(%s) = (%q, %v, %v)", usd, hash, settled, ok)
+	}
+	if _, _, ok := l.TaskKeyHash(tau, "task-k"); ok {
+		t.Fatalf("key hash was recorded in %s, which has no provisioner", tau)
+	}
+}
+
 // quotaServer serves a document shaped like a quota endpoint's response and
 // records what it was asked.
 type quotaServer struct {
@@ -382,6 +403,13 @@ func (q *quotaServer) set(fn func(q *quotaServer)) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	fn(q)
+}
+
+// seen returns the request count and the last Authorization header.
+func (q *quotaServer) seen() (int, string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.requests, q.lastAuth
 }
 
 func (q *quotaServer) poller(t *testing.T) *balancesync.Poller {
@@ -437,8 +465,8 @@ func TestSyncPoolReconcilesWithUnsettledReservations(t *testing.T) {
 	if got := balance(); got != 5 {
 		t.Fatalf("balance after sync = %v, want 5 (13 available - 8 unsettled)", got)
 	}
-	if q.lastAuth != "Bearer "+quotaToken {
-		t.Fatalf("endpoint saw Authorization %q", q.lastAuth)
+	if _, auth := q.seen(); auth != "Bearer "+quotaToken {
+		t.Fatalf("endpoint saw Authorization %q", auth)
 	}
 	if bal, _ := l.Balance(usd); bal != 45 {
 		t.Fatalf("unsynced pool balance = %v, want 45", bal)
@@ -497,8 +525,8 @@ func TestSyncPoolReconcilesWithUnsettledReservations(t *testing.T) {
 	if got := balance(); got != 5 {
 		t.Fatalf("balance after settle during read = %v, want 5 (8 available - 3 unsettled)", got)
 	}
-	if q.requests != 2 {
-		t.Fatalf("endpoint requests = %d, want 2 (one discarded reading, one re-read)", q.requests)
+	if n, _ := q.seen(); n != 2 {
+		t.Fatalf("endpoint requests = %d, want 2 (one discarded reading, one re-read)", n)
 	}
 
 	// When every read overlaps a settlement, the sync stops after
@@ -514,8 +542,8 @@ func TestSyncPoolReconcilesWithUnsettledReservations(t *testing.T) {
 		}
 	})
 	p.syncPool(ctx, tau, src)
-	if q.requests != maxSyncAttempts {
-		t.Fatalf("endpoint requests = %d, want %d", q.requests, maxSyncAttempts)
+	if n, _ := q.seen(); n != maxSyncAttempts {
+		t.Fatalf("endpoint requests = %d, want %d", n, maxSyncAttempts)
 	}
 	if got := balance(); got != 5 {
 		t.Fatalf("balance after discarded readings = %v, want 5", got)

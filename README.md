@@ -143,7 +143,9 @@ After each read the pool's cap becomes the external cap and its balance becomes
 max(0, external available - reservations of tasks not yet settled)
 ```
 
-so capacity already promised to running tasks is not offered a second time. Until a task settles, its full reservation is subtracted even if the endpoint already counts part of its spend, which makes the advertised balance lower than the true one for that period and never higher.
+so capacity already promised to running tasks is not offered a second time. Until a task settles, its full reservation is subtracted even if the endpoint already counts part of its spend, which makes the advertised balance lower than the true one while the task runs.
+
+The advertised balance can be higher than the true one in two cases. If the endpoint reports a task's spend some time after the task settles, reads in between see the reservation gone and the spend not yet counted. Spend against the same external quota that did not pass through a task reservation is visible only after the next read.
 
 When a read fails (connection error, timeout, a status other than 200, or a response without the configured paths), the provider logs the failure and keeps advertising the last balance. There is no limit on how long it does so. The credential value is never written to the log or the state file.
 
