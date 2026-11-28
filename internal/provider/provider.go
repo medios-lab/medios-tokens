@@ -12,10 +12,12 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,47 +27,128 @@ import (
 	"github.com/medios-lab/medios-tokens/internal/recordio"
 )
 
+// maxSyncAttempts is the number of external reads one sync of a pool may
+// make. Heuristic: a reading is discarded when a task in the pool settled
+// while the read was in flight, and one immediate re-read usually lands in a
+// quiet window; a second discard waits for the next interval so a busy pool
+// cannot multiply requests against the external endpoint.
+const maxSyncAttempts = 2
+
+// errSyncedPool is returned when a refill targets a pool whose balance is
+// read from an external endpoint; the next read would overwrite the refill.
+var errSyncedPool = errors.New("pool balance is synced from an external endpoint and cannot be refilled")
+
+// BalanceSource reads a pool's balance from the system that owns its quota.
+type BalanceSource interface {
+	Fetch(ctx context.Context) (ledger.External, error)
+}
+
+// PoolOptions configures the provider's handling of one ledger pool.
+type PoolOptions struct {
+	// RefillAmount is added to the pool on each refill trigger (SIGUSR1,
+	// timer, or a /refill request without an amount). Zero disables triggers
+	// for the pool.
+	RefillAmount float64
+	// Source, when set, makes the pool's balance follow an external reading
+	// taken once before subscribing and then every SyncInterval.
+	Source       BalanceSource
+	SyncInterval time.Duration
+}
+
 type Config struct {
-	ControllerURL  string
-	NodeURL        string
-	ProviderName   string
-	ProviderType   string
-	ResourceName   string
-	RefillAmount   float64
+	ControllerURL string
+	NodeURL       string
+	ProviderName  string
+	ProviderType  string
+	// Pools holds options keyed by ledger pool name. A ledger pool without
+	// an entry gets the zero PoolOptions.
+	Pools          map[string]PoolOptions
 	RefillInterval time.Duration
 	AdminAddr      string
 	Provisioner    provisioner.Provisioner
+	// ProvisionerResource names the pool whose tasks the Provisioner mints
+	// keys for and settles. It may be empty only when the ledger has one pool.
+	ProvisionerResource string
 }
 
 type Provider struct {
-	cfg    Config
-	ledger *ledger.Ledger
-	client *http.Client
-	logger *log.Logger
+	cfg       Config
+	ledger    *ledger.Ledger
+	resources []string
+	client    *http.Client
+	logger    *log.Logger
 
 	mu       sync.Mutex
 	streamID string
+
+	// advMu serializes Advertise so the balances read from the ledger and
+	// the UPDATE_STATE that carries them reach the node in the same order.
+	advMu sync.Mutex
+	// advPending is true while the node may hold balances older than the
+	// ledger's: the most recent UPDATE_STATE failed. Guarded by advMu.
+	advPending bool
 }
 
-func New(cfg Config, l *ledger.Ledger, logger *log.Logger) *Provider {
+func New(cfg Config, l *ledger.Ledger, logger *log.Logger) (*Provider, error) {
 	if cfg.ProviderType == "" {
 		cfg.ProviderType = "org.medios.rp.tokens"
 	}
 	if cfg.ProviderName == "" {
 		cfg.ProviderName = "medios-tokens"
 	}
-	if cfg.ResourceName == "" {
-		cfg.ResourceName = "token_budget"
-	}
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Provider{
-		cfg:    cfg,
-		ledger: l,
-		client: &http.Client{Timeout: 15 * time.Second},
-		logger: logger,
+	p := &Provider{
+		cfg:       cfg,
+		ledger:    l,
+		resources: l.Resources(),
+		client:    &http.Client{Timeout: 15 * time.Second},
+		logger:    logger,
 	}
+	for name, opts := range cfg.Pools {
+		if !p.hasPool(name) {
+			return nil, fmt.Errorf("options given for pool %q, which is not in the ledger", name)
+		}
+		if opts.RefillAmount < 0 {
+			return nil, fmt.Errorf("pool %q: refill amount must be non-negative", name)
+		}
+		if opts.Source != nil && opts.SyncInterval <= 0 {
+			return nil, fmt.Errorf("pool %q: sync interval must be positive", name)
+		}
+		if opts.Source != nil && opts.RefillAmount > 0 {
+			return nil, fmt.Errorf("pool %q: %w", name, errSyncedPool)
+		}
+	}
+	if cfg.Provisioner != nil {
+		resource, err := p.resolveResource(cfg.ProvisionerResource)
+		if err != nil {
+			return nil, fmt.Errorf("provisioner pool: %w", err)
+		}
+		p.cfg.ProvisionerResource = resource
+	}
+	return p, nil
+}
+
+func (p *Provider) hasPool(name string) bool {
+	i := sort.SearchStrings(p.resources, name)
+	return i < len(p.resources) && p.resources[i] == name
+}
+
+// resolveResource maps a request's optional resource name to a pool. An empty
+// name selects the pool only when the ledger has exactly one.
+func (p *Provider) resolveResource(name string) (string, error) {
+	if name == "" {
+		if len(p.resources) == 1 {
+			return p.resources[0], nil
+		}
+		return "", fmt.Errorf("\"resource\" is required: provider has %d pools (%s)",
+			len(p.resources), strings.Join(p.resources, ", "))
+	}
+	if !p.hasPool(name) {
+		return "", fmt.Errorf("unknown resource %q (pools: %s)", name, strings.Join(p.resources, ", "))
+	}
+	return name, nil
 }
 
 func randomUUIDBase64() string {
@@ -86,7 +169,10 @@ type rpEvent struct {
 		ProviderID idVal `json:"provider_id"`
 	} `json:"subscribed"`
 	PublishResources *struct {
-		UUID idVal `json:"uuid"`
+		UUID      idVal `json:"uuid"`
+		Resources []struct {
+			Name string `json:"name"`
+		} `json:"resources"`
 	} `json:"publish_resources"`
 }
 
@@ -147,8 +233,21 @@ func (p *Provider) postJSON(ctx context.Context, url string, payload any, stream
 	return resp.StatusCode, string(raw), nil
 }
 
-// Advertise pushes the ledger's current balance to medios-node via UPDATE_STATE.
+// formatBalances renders pool balances in name order for log lines.
+func (p *Provider) formatBalances(balances map[string]float64) string {
+	parts := make([]string, 0, len(p.resources))
+	for _, name := range p.resources {
+		parts = append(parts, fmt.Sprintf("%s=%.6g", name, balances[name]))
+	}
+	return strings.Join(parts, " ")
+}
+
+// Advertise pushes every pool's current balance to medios-node in one
+// UPDATE_STATE: one scalar resource per pool with a positive balance.
 func (p *Provider) Advertise(ctx context.Context, reason string) error {
+	p.advMu.Lock()
+	defer p.advMu.Unlock()
+
 	p.mu.Lock()
 	sid := p.streamID
 	p.mu.Unlock()
@@ -157,15 +256,17 @@ func (p *Provider) Advertise(ctx context.Context, reason string) error {
 		return nil
 	}
 
-	bal := p.ledger.Balance()
+	balances := p.ledger.Balances()
 	resources := []map[string]any{}
-	if bal > 0 {
-		resources = append(resources, map[string]any{
-			"name":        p.cfg.ResourceName,
-			"type":        "SCALAR",
-			"scalar":      map[string]any{"value": bal},
-			"provider_id": map[string]any{"value": pid},
-		})
+	for _, name := range p.resources {
+		if bal := balances[name]; bal > 0 {
+			resources = append(resources, map[string]any{
+				"name":        name,
+				"type":        "SCALAR",
+				"scalar":      map[string]any{"value": bal},
+				"provider_id": map[string]any{"value": pid},
+			})
+		}
 	}
 
 	call := map[string]any{
@@ -181,49 +282,143 @@ func (p *Provider) Advertise(ctx context.Context, reason string) error {
 	endpoint := strings.TrimRight(p.cfg.NodeURL, "/") + "/api/v1/resource_provider"
 	st, body, err := p.postJSON(ctx, endpoint, call, sid)
 	if err != nil {
+		p.advPending = true
 		return err
 	}
 	if st != http.StatusAccepted {
+		p.advPending = true
 		return fmt.Errorf("UPDATE_STATE returned HTTP %d: %s", st, body)
 	}
-	p.logger.Printf("UPDATE_STATE %s=%.6g (%s)", p.cfg.ResourceName, bal, reason)
+	p.advPending = false
+	p.logger.Printf("UPDATE_STATE %s (%s)", p.formatBalances(balances), reason)
 	return nil
 }
 
-// Refill tops up the ledger by amount (up to cap) and advertises if changed.
-func (p *Provider) Refill(ctx context.Context, amount float64, source string) (float64, error) {
-	bal, changed, err := p.ledger.Refill(amount)
+// Refill tops up one pool by amount (up to its cap) and advertises if changed.
+func (p *Provider) Refill(ctx context.Context, resource string, amount float64, source string) (float64, error) {
+	if p.cfg.Pools[resource].Source != nil {
+		return 0, fmt.Errorf("pool %q: %w", resource, errSyncedPool)
+	}
+	bal, changed, err := p.ledger.Refill(resource, amount)
 	if err != nil {
 		return bal, err
 	}
 	if changed {
-		if err := p.Advertise(ctx, fmt.Sprintf("refill +%.6g via %s", amount, source)); err != nil {
+		if err := p.Advertise(ctx, fmt.Sprintf("refill %s +%.6g via %s", resource, amount, source)); err != nil {
 			return bal, err
 		}
 	}
 	return bal, nil
 }
 
-// Settle reconciles actual consumption for taskID, releases unused credit back
-// to the balance, and advertises the updated capacity.
-func (p *Provider) Settle(ctx context.Context, taskID string, actual float64) (float64, float64, error) {
-	delta, bal, err := p.ledger.SettleTask(taskID, actual)
+// RefillAll applies each pool's configured RefillAmount. Pools with a zero
+// amount are left alone.
+func (p *Provider) RefillAll(ctx context.Context, source string) error {
+	var errs []error
+	for _, name := range p.resources {
+		amount := p.cfg.Pools[name].RefillAmount
+		if amount <= 0 {
+			continue
+		}
+		if _, err := p.Refill(ctx, name, amount, source); err != nil {
+			errs = append(errs, fmt.Errorf("pool %q: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (p *Provider) hasRefillAmount() bool {
+	for _, opts := range p.cfg.Pools {
+		if opts.RefillAmount > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// Settle reconciles actual consumption for taskID in one pool, releases
+// unused credit back to the balance, and advertises the updated capacity.
+func (p *Provider) Settle(ctx context.Context, resource, taskID string, actual float64) (float64, float64, error) {
+	delta, bal, err := p.ledger.SettleTask(resource, taskID, actual)
 	if err != nil {
 		return delta, bal, err
 	}
 	if delta != 0 {
-		if err := p.Advertise(ctx, fmt.Sprintf("settled task %s actual=%.6g delta=%+.6g", taskID, actual, delta)); err != nil {
+		if err := p.Advertise(ctx, fmt.Sprintf("settled task %s in %s actual=%.6g delta=%+.6g", taskID, resource, actual, delta)); err != nil {
 			return delta, bal, err
 		}
 	}
 	return delta, bal, nil
 }
 
-// AdminHandler exposes tiny local endpoints for inspecting balance, settling
+// advertisePending reports whether the last UPDATE_STATE failed.
+func (p *Provider) advertisePending() bool {
+	p.advMu.Lock()
+	defer p.advMu.Unlock()
+	return p.advPending
+}
+
+// syncPool reads one pool's external balance, applies it to the ledger and
+// advertises if the pool changed. It also advertises when the previous
+// UPDATE_STATE failed, whatever this read returned, so the node does not keep
+// balances older than the ledger's after a failed call.
+func (p *Provider) syncPool(ctx context.Context, resource string, src BalanceSource) {
+	reason, changed := p.reconcilePool(ctx, resource, src)
+	if !changed {
+		if !p.advertisePending() {
+			return
+		}
+		reason = "retry after failed UPDATE_STATE"
+	}
+	if err := p.Advertise(ctx, reason); err != nil && ctx.Err() == nil {
+		p.logger.Printf("advertise error after sync of %s: %v", resource, err)
+	}
+}
+
+// reconcilePool reads one pool's external balance and applies it to the
+// ledger. A failed read or an unusable response leaves the pool as it was.
+// It returns whether the pool changed and the reason to advertise with.
+func (p *Provider) reconcilePool(ctx context.Context, resource string, src BalanceSource) (string, bool) {
+	for attempt := 1; attempt <= maxSyncAttempts; attempt++ {
+		epoch := p.ledger.SettleEpoch(resource)
+		reading, err := src.Fetch(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				bal, _ := p.ledger.Balance(resource)
+				p.logger.Printf("balance sync for %s failed, keeping balance %.6g: %v", resource, bal, err)
+			}
+			return "", false
+		}
+		changed, err := p.ledger.Reconcile(resource, epoch, reading)
+		if errors.Is(err, ledger.ErrStaleReading) {
+			continue
+		}
+		if err != nil {
+			p.logger.Printf("balance sync for %s not applied: %v", resource, err)
+			return "", false
+		}
+		return fmt.Sprintf("synced %s external available=%.6g", resource, reading.Available), changed
+	}
+	p.logger.Printf("balance sync for %s discarded %d readings taken across task settlements; retrying next interval",
+		resource, maxSyncAttempts)
+	return "", false
+}
+
+// writeJSON sends v as a JSON response body.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// AdminHandler exposes tiny local endpoints for inspecting balances, settling
 // actual spend, and triggering external refills:
-//   GET  /balance
-//   POST /settle  {"task_id":"...", "actual": 18.0}
-//   POST /refill  {"amount": 40.0}
+//
+//	GET  /balance
+//	POST /settle  {"task_id":"...", "actual": 18.0, "resource": "..."}
+//	POST /refill  {"amount": 40.0, "resource": "..."}
+//
+// "resource" names the pool. It may be omitted only when the provider has
+// one pool.
 func (p *Provider) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/balance", func(w http.ResponseWriter, r *http.Request) {
@@ -231,8 +426,25 @@ func (p *Provider) AdminHandler() http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(p.ledger.Snapshot())
+		snap := p.ledger.Snapshot()
+		out := map[string]any{"version": snap.Version, "pools": snap.Pools}
+		if snap.ProviderID != "" {
+			out["provider_id"] = snap.ProviderID
+		}
+		// With one pool, its fields are also returned at the top level, the
+		// shape single-pool clients read.
+		if len(snap.Pools) == 1 {
+			for name, pool := range snap.Pools {
+				out["resource"] = name
+				out["balance"] = pool.Balance
+				out["cap"] = pool.Cap
+				out["tasks"] = pool.Tasks
+				if pool.Frozen {
+					out["frozen"] = true
+				}
+			}
+		}
+		writeJSON(w, out)
 	})
 	mux.HandleFunc("/settle", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -240,20 +452,25 @@ func (p *Provider) AdminHandler() http.Handler {
 			return
 		}
 		var req struct {
-			TaskID string  `json:"task_id"`
-			Actual float64 `json:"actual"`
+			TaskID   string  `json:"task_id"`
+			Actual   float64 `json:"actual"`
+			Resource string  `json:"resource"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TaskID == "" {
-			http.Error(w, "expecting JSON {\"task_id\": \"...\", \"actual\": <number>}", http.StatusBadRequest)
+			http.Error(w, "expecting JSON {\"task_id\": \"...\", \"actual\": <number>, \"resource\": \"<pool>\"}", http.StatusBadRequest)
 			return
 		}
-		delta, bal, err := p.Settle(r.Context(), req.TaskID, req.Actual)
+		resource, err := p.resolveResource(req.Resource)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"task_id": req.TaskID, "delta": delta, "balance": bal})
+		delta, bal, err := p.Settle(r.Context(), resource, req.TaskID, req.Actual)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"task_id": req.TaskID, "resource": resource, "delta": delta, "balance": bal})
 	})
 	mux.HandleFunc("/refill", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -261,18 +478,30 @@ func (p *Provider) AdminHandler() http.Handler {
 			return
 		}
 		var req struct {
-			Amount float64 `json:"amount"`
+			Amount   float64 `json:"amount"`
+			Resource string  `json:"resource"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Amount <= 0 {
-			req.Amount = p.cfg.RefillAmount
+		// A missing or malformed body is a request for the pool's configured
+		// refill amount.
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resource, err := p.resolveResource(req.Resource)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
-		bal, err := p.Refill(r.Context(), req.Amount, "http")
+		if req.Amount <= 0 {
+			req.Amount = p.cfg.Pools[resource].RefillAmount
+		}
+		bal, err := p.Refill(r.Context(), resource, req.Amount, "http")
+		if errors.Is(err, errSyncedPool) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"balance": bal})
+		writeJSON(w, map[string]any{"resource": resource, "balance": bal})
 	})
 	mux.HandleFunc("/provision", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -296,19 +525,56 @@ func (p *Provider) AdminHandler() http.Handler {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		if err := p.ledger.RecordKeyHash(req.TaskID, grant.Hash); err != nil {
+		if err := p.ledger.RecordKeyHash(p.cfg.ProvisionerResource, req.TaskID, grant.Hash); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, map[string]any{
 			"task_id":  req.TaskID,
+			"resource": p.cfg.ProvisionerResource,
 			"key_hash": grant.Hash,
 			"key":      grant.Secret,
 			"limit":    grant.Limit,
 		})
 	})
 	return mux
+}
+
+// formatRequests renders a task's per-pool amounts in name order for log lines.
+func formatRequests(reqs map[string]float64) string {
+	names := make([]string, 0, len(reqs))
+	for name := range reqs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s=%.6g", name, reqs[name]))
+	}
+	return strings.Join(parts, " ")
+}
+
+// debitTask records one launched task's reservation in every pool it names.
+// All pools are debited in one ledger update. The task is already running
+// when TASK_ADDED arrives, so when a pool holds less than the task carries
+// (its balance dropped after the offer went out) the shortfall is logged and
+// the reservation is still recorded: that pool's balance drops to zero and
+// the ledger keeps the shortfall as the pool's deficit.
+func (p *Provider) debitTask(ctx context.Context, taskID string, reqs map[string]float64) {
+	changed, err := p.ledger.ReserveMany(taskID, reqs)
+	if errors.Is(err, ledger.ErrInsufficient) {
+		p.logger.Printf("task %s launched beyond available balance (%v); recording its reservation", taskID, err)
+		changed, err = p.ledger.DebitMany(taskID, reqs)
+	}
+	if err != nil {
+		p.logger.Printf("debit error for task %s: %v", taskID, err)
+		return
+	}
+	if changed {
+		if err := p.Advertise(ctx, fmt.Sprintf("debited %s for task %s", formatRequests(reqs), taskID)); err != nil {
+			p.logger.Printf("advertise error after debit %s: %v", taskID, err)
+		}
+	}
 }
 
 func (p *Provider) watchController(ctx context.Context) error {
@@ -344,26 +610,14 @@ func (p *Provider) watchController(ctx context.Context) error {
 			}
 			taskID := ev.TaskAdded.Task.TaskID.Value
 			pid := p.ledger.ProviderID()
-			var spent float64
+			reqs := make(map[string]float64)
 			for _, res := range ev.TaskAdded.Task.Resources {
-				if res.Name == p.cfg.ResourceName && res.Type == "SCALAR" &&
+				if p.hasPool(res.Name) && res.Type == "SCALAR" &&
 					res.ProviderID != nil && res.ProviderID.Value == pid && res.Scalar != nil {
-					spent += res.Scalar.Value
+					reqs[res.Name] += res.Scalar.Value
 				}
 			}
-			if spent <= 0 {
-				continue
-			}
-			_, changed, err := p.ledger.DebitTask(taskID, spent)
-			if err != nil {
-				p.logger.Printf("debit error for task %s: %v", taskID, err)
-				continue
-			}
-			if changed {
-				if err := p.Advertise(ctx, fmt.Sprintf("debited %.6g for task %s", spent, taskID)); err != nil {
-					p.logger.Printf("advertise error after debit %s: %v", taskID, err)
-				}
-			}
+			p.debitTask(ctx, taskID, reqs)
 
 		case "TASK_UPDATED":
 			if ev.TaskUpdated == nil || ev.TaskUpdated.Status == nil || p.cfg.Provisioner == nil {
@@ -377,7 +631,8 @@ func (p *Provider) watchController(ctx context.Context) error {
 			if taskID == "" || !isTerminalTaskState(state) {
 				continue
 			}
-			keyHash, settled, ok := p.ledger.TaskKeyHash(taskID)
+			resource := p.cfg.ProvisionerResource
+			keyHash, settled, ok := p.ledger.TaskKeyHash(resource, taskID)
 			if !ok || settled {
 				continue
 			}
@@ -386,12 +641,12 @@ func (p *Provider) watchController(ctx context.Context) error {
 				p.logger.Printf("provisioner settle/revoke failed for task %s (%s): %v", taskID, state, err)
 				continue
 			}
-			delta, bal, err := p.Settle(ctx, taskID, actual)
+			delta, bal, err := p.Settle(ctx, resource, taskID, actual)
 			if err != nil {
 				p.logger.Printf("ledger settle failed for task %s: %v", taskID, err)
 				continue
 			}
-			p.logger.Printf("auto-settled provisioned task %s on %s actual=%.6g delta=%+.6g balance=%.6g", taskID, state, actual, delta, bal)
+			p.logger.Printf("auto-settled provisioned task %s in %s on %s actual=%.6g delta=%+.6g balance=%.6g", taskID, resource, state, actual, delta, bal)
 		}
 	}
 }
@@ -399,6 +654,15 @@ func (p *Provider) watchController(ctx context.Context) error {
 // Run subscribes to the node Resource Provider API and controller event stream
 // until ctx is cancelled or the provider stream terminates.
 func (p *Provider) Run(ctx context.Context) error {
+	// Read each synced pool's external balance before subscribing, so the
+	// first UPDATE_STATE carries it. A failed read leaves the checkpointed or
+	// configured balance in place.
+	for _, name := range p.resources {
+		if src := p.cfg.Pools[name].Source; src != nil {
+			p.syncPool(ctx, name, src)
+		}
+	}
+
 	info := map[string]any{
 		"type": p.cfg.ProviderType,
 		"name": p.cfg.ProviderName,
@@ -464,7 +728,7 @@ func (p *Provider) Run(ctx context.Context) error {
 			if err := p.ledger.SetProviderID(pid); err != nil {
 				return fmt.Errorf("checkpoint provider_id: %w", err)
 			}
-			p.logger.Printf("subscribed provider_id=%s resource=%s balance=%.6g", pid, p.cfg.ResourceName, p.ledger.Balance())
+			p.logger.Printf("subscribed provider_id=%s %s", pid, p.formatBalances(p.ledger.Balances()))
 			if err := p.Advertise(subCtx, "initial"); err != nil {
 				return err
 			}
@@ -475,7 +739,7 @@ func (p *Provider) Run(ctx context.Context) error {
 						p.logger.Printf("controller watcher exited: %v", err)
 					}
 				}()
-				if p.cfg.RefillInterval > 0 && p.cfg.RefillAmount > 0 {
+				if p.cfg.RefillInterval > 0 && p.hasRefillAmount() {
 					go func() {
 						ticker := time.NewTicker(p.cfg.RefillInterval)
 						defer ticker.Stop()
@@ -484,9 +748,27 @@ func (p *Provider) Run(ctx context.Context) error {
 							case <-subCtx.Done():
 								return
 							case <-ticker.C:
-								if _, err := p.Refill(subCtx, p.cfg.RefillAmount, "timer"); err != nil && subCtx.Err() == nil {
+								if err := p.RefillAll(subCtx, "timer"); err != nil && subCtx.Err() == nil {
 									p.logger.Printf("timer refill failed: %v", err)
 								}
+							}
+						}
+					}()
+				}
+				for _, name := range p.resources {
+					opts := p.cfg.Pools[name]
+					if opts.Source == nil {
+						continue
+					}
+					go func() {
+						ticker := time.NewTicker(opts.SyncInterval)
+						defer ticker.Stop()
+						for {
+							select {
+							case <-subCtx.Done():
+								return
+							case <-ticker.C:
+								p.syncPool(subCtx, name, opts.Source)
 							}
 						}
 					}()
@@ -497,8 +779,17 @@ func (p *Provider) Run(ctx context.Context) error {
 			if ev.PublishResources == nil {
 				continue
 			}
+			// The event carries no task ID, so nothing is debited here; the
+			// debit happens on TASK_ADDED. The publish is refused when a
+			// pool it names is frozen.
+			var names []string
+			for _, res := range ev.PublishResources.Resources {
+				if p.hasPool(res.Name) {
+					names = append(names, res.Name)
+				}
+			}
 			status := "OK"
-			if !p.ledger.CanAuthorize() {
+			if !p.ledger.CanAuthorize(names) {
 				status = "FAILED"
 			}
 			p.mu.Lock()

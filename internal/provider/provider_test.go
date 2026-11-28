@@ -105,12 +105,14 @@ func TestProviderReserveAuthorizeSettleRefill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := New(Config{
+	p, err := New(Config{
 		ControllerURL: ctrlSrv.URL,
 		NodeURL:       nodeSrv.URL,
-		ResourceName:  "token_budget",
-		RefillAmount:  10,
+		Pools:         map[string]PoolOptions{"token_budget": {RefillAmount: 10}},
 	}, l, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -268,12 +270,14 @@ func TestProviderScopedKeyProvisionAndTerminalSettle(t *testing.T) {
 		t.Fatal(err)
 	}
 	fp := &fakeProvisioner{actual: 6.5}
-	p := New(Config{
+	p, err := New(Config{
 		ControllerURL: ctrlSrv.URL,
 		NodeURL:       nodeSrv.URL,
-		ResourceName:  "token_budget",
 		Provisioner:   fp,
 	}, l, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
