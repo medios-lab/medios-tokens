@@ -143,19 +143,27 @@ After each read the pool's cap becomes the external cap and its balance becomes
 max(0, external available - reservations of tasks not yet settled)
 ```
 
-so capacity already promised to running tasks is not offered a second time. While a task runs, its full reservation is subtracted even if the endpoint already counts part of its spend, which makes the advertised balance lower than the true one.
+The balance is what `/balance` reports and what a new reservation is checked against. It is not the value sent to the node. The broker's allocator offers a resource's advertised total less what tasks already hold, so it subtracts a running task's reservation itself, and a total that had the reservation subtracted as well would count it twice. The provider therefore advertises a synced pool as
 
-A synced pool closes a task's reservation when the task ends. On a terminal `TASK_UPDATED` event from the controller (finished, failed, killed, lost, gone, error or dropped), the provider marks the task's reservation in every synced pool as settled and leaves the balance where it is. The next read then sets the balance from the endpoint's figure without subtracting that reservation. Frameworks do not call `/settle` for a synced pool, because the endpoint's own count is the record of what the task spent. Between the end of the task and the next read, the balance is lower than the true one by whatever part of the reservation the task did not spend. The reservation is not returned at once because the endpoint may already count the task's spend, and the returned amount would then be advertised twice.
+```
+balance + max(0, reservations of tasks not yet settled - deficit)
+```
+
+which is the external figure while those tasks run. With 33 remaining and one running task that reserved 5, the balance is 28, the advertised total is 33, and the allocator offers 28. A new reservation changes the balance and leaves the total alone, so it sends no `UPDATE_STATE`.
+
+While a task runs, its full reservation is held back even if the endpoint already counts part of its spend, so the amount on offer is lower than the true one.
+
+A synced pool closes a task's reservation when the task ends. On a terminal `TASK_UPDATED` event from the controller (finished, failed, killed, lost, gone, error or dropped), the provider marks the task's reservation in every synced pool as settled and leaves the balance where it is. The advertised total drops by the reservation, to the balance, because the allocator has stopped subtracting the ended task. The next read then sets the balance from the endpoint's figure without subtracting that reservation. Frameworks do not call `/settle` for a synced pool, because the endpoint's own count is the record of what the task spent. Between the end of the task and the next read, the balance and the total are lower than the true figure by whatever part of the reservation the task did not spend. The reservation is not returned at once because the endpoint may already count the task's spend, and the returned amount would then be advertised twice. The controller frees the task's allocation before the provider's lower total reaches the node, so for that interval the allocator can offer up to the reservation more than the balance.
 
 A `/settle` for the same task before or after the terminal event is accepted and is applied once: whichever arrives second changes nothing. An entry closed by a terminal event shows `"released": true` under `tasks` in `/balance`, with `actual` equal to the reservation because the ledger was not told the spend. Pools without `sync` are unchanged and keep a reservation open until `/settle` reports the spend.
 
 A task ending the provider did not receive an event for is picked up from the controller's task snapshot at the next subscription (see [Controller event stream](#controller-event-stream)).
 
-The advertised balance can be higher than the true one in two cases. If the endpoint reports a task's spend some time after the task ends, reads in between see the reservation gone and the spend not yet counted. Spend against the same external quota that did not pass through a task reservation is visible only after the next read.
+The amount on offer can be higher than the true one in three cases. If the endpoint reports a task's spend some time after the task ends, reads in between see the reservation gone and the spend not yet counted. Spend against the same external quota that did not pass through a task reservation is visible only after the next read. A reservation whose task ended without the provider learning of it is still added to the total while the allocator subtracts nothing for it, until a terminal event, a controller snapshot that lists the task as ended, or a `/settle` closes it.
 
-When a read reports less than the unsettled reservations, the balance is zero and the ledger records the uncovered amount as the pool's `deficit` in the checkpoint. A task that then settles below its reservation pays the deficit down first, so the balance rises only by what the external reading covers. If the node rejects an `UPDATE_STATE`, the next read of any synced pool sends the current balances again, whether or not that read changed anything.
+When a read reports less than the unsettled reservations, the balance is zero and the ledger records the uncovered amount as the pool's `deficit` in the checkpoint. The advertised total is then the external figure: 3 remaining with 5 reserved is advertised as 3. A task that then settles below its reservation pays the deficit down first, so the balance rises only by what the external reading covers. If the node rejects an `UPDATE_STATE`, the next read of any synced pool sends the current totals again, whether or not that read changed anything.
 
-When a read fails (connection error, timeout, a status other than 200, or a response without the configured paths), the provider logs the failure and keeps advertising the last balance. There is no limit on how long it does so. The credential value is never written to the log or the state file.
+When a read fails (connection error, timeout, a status other than 200, or a response without the configured paths), the provider logs the failure and keeps advertising from the last balance. There is no limit on how long it does so. The credential value is never written to the log or the state file.
 
 `POST /refill` on a synced pool returns HTTP 409.
 
