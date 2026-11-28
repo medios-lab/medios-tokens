@@ -228,7 +228,8 @@ func twoPoolLedger(t *testing.T) *ledger.Ledger {
 
 func TestMultiPoolAdvertiseDebitSettleRefill(t *testing.T) {
 	logs := &syncBuffer{}
-	h := startHarness(t, twoPoolLedger(t), Config{}, logs)
+	l := twoPoolLedger(t)
+	h := startHarness(t, l, Config{}, logs)
 
 	// One UPDATE_STATE carries both pools.
 	h.waitStates(1)
@@ -237,16 +238,16 @@ func TestMultiPoolAdvertiseDebitSettleRefill(t *testing.T) {
 	// entry has no provider ID and is not a pool.
 	h.events <- taskAdded("task-1", scalar(tau, 60), scalar(usd, 2),
 		map[string]any{"name": "cpus", "type": "SCALAR", "scalar": map[string]any{"value": 1.0}})
-	h.waitStates(2)
+	waitReserved(t, l, usd, "task-1")
 
 	// A replayed TASK_ADDED does not debit again; the next event proves it
 	// was processed.
 	h.events <- taskAdded("task-1", scalar(tau, 60), scalar(usd, 2))
 
 	// A task that carries more than a pool holds is already running, so its
-	// reservation is recorded and the short pool drops to zero.
+	// reservation is recorded and the short pool's balance drops to zero.
 	h.events <- taskAdded("task-2", scalar(tau, 10), scalar(usd, 75))
-	h.waitStates(3)
+	waitReserved(t, l, usd, "task-2")
 
 	// With two pools, /settle and /refill need "resource".
 	if code, _ := h.post("/settle", `{"task_id":"task-1","actual":45}`); code != http.StatusBadRequest {
@@ -268,12 +269,14 @@ func TestMultiPoolAdvertiseDebitSettleRefill(t *testing.T) {
 		t.Fatalf("/refill = HTTP %d %v, want balance 1.5", code, body)
 	}
 
+	// The debits change no total: both tasks run, so the allocator
+	// subtracts their allocations from 1000 and 50. Settling task-1 takes
+	// its 60 out of the total and returns 15. The refill raises the short
+	// pool's total, which stays below the 77 allocated from it.
 	want := []map[string]float64{
 		{tau: 1000, usd: 50},
-		{tau: 940, usd: 48},
-		{tau: 930}, // usd is at zero and is not advertised
-		{tau: 945},
-		{tau: 945, usd: 1.5},
+		{tau: 955, usd: 50},
+		{tau: 955, usd: 51.5},
 	}
 	if got := h.waitStates(len(want)); !reflect.DeepEqual(got, want) {
 		t.Fatalf("advertised = %v\nwant        %v", got, want)
@@ -604,11 +607,21 @@ func TestRunAdvertisesSyncedBalance(t *testing.T) {
 		t.Fatalf("second UPDATE_STATE = %v, want %s=10 %s=50", got, tau, usd)
 	}
 
-	// A reservation is subtracted from the synced balance.
+	// A reservation is subtracted from the balance and not from the
+	// advertised total, which stays at the external figure.
 	h.events <- taskAdded("task-1", scalar(tau, 4))
-	if got := h.waitStates(3)[2]; !reflect.DeepEqual(got, map[string]float64{tau: 6, usd: 50}) {
-		t.Fatalf("third UPDATE_STATE = %v, want %s=6 %s=50", got, tau, usd)
+	waitReserved(t, l, tau, "task-1")
+	if bal, _ := l.Balance(tau); bal != 6 {
+		t.Fatalf("balance = %v, want 6", bal)
 	}
+	// The next change at the endpoint follows the two totals directly: the
+	// debit sent no UPDATE_STATE in between.
+	q.set(func(q *quotaServer) { q.used = 992 })
+	wantStates(t, h,
+		map[string]float64{tau: 13, usd: 50},
+		map[string]float64{tau: 10, usd: 50},
+		map[string]float64{tau: 8, usd: 50},
+	)
 }
 
 // /balance must be readable while debits and syncs run; run with -race.
@@ -785,41 +798,73 @@ func waitClosed(t *testing.T, l *ledger.Ledger, taskID string) ledger.TaskEntry 
 	return ledger.TaskEntry{}
 }
 
+// waitReserved blocks until the task's debit is recorded in the pool. A debit
+// in a synced pool does not change the advertised total, so tests cannot wait
+// for an UPDATE_STATE.
+func waitReserved(t *testing.T, l *ledger.Ledger, resource, taskID string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if e := l.Snapshot().Pools[resource].Tasks[taskID]; e.Reserved > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("task %s was not debited in %s", taskID, resource)
+}
+
+// tauBalance returns the ledger balance of the synced pool.
+func tauBalance(t *testing.T, l *ledger.Ledger) float64 {
+	t.Helper()
+	bal, err := l.Balance(tau)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bal
+}
+
 func TestSyncedPoolClosesReservationWhenTaskEnds(t *testing.T) {
 	for _, state := range []string{"TASK_FINISHED", "TASK_KILLED", "TASK_LOST"} {
 		t.Run(state, func(t *testing.T) {
 			h, l, q := syncedHarness(t, "")
+			// The debit lowers the balances to 18 and 48. The advertised
+			// totals stay 38 and 50: the allocator subtracts the task's
+			// allocation itself.
 			h.events <- taskAdded("task-1", scalar(tau, 20), scalar(usd, 2))
-			wantStates(t, h,
-				map[string]float64{tau: 38, usd: 50},
-				map[string]float64{tau: 18, usd: 48},
-			)
+			waitReserved(t, l, usd, "task-1")
+			if bal := tauBalance(t, l); bal != 18 {
+				t.Fatalf("balance after debit = %v, want 18", bal)
+			}
 
 			// A non-terminal update leaves the reservation open. The debit
 			// behind it on the stream proves it was processed.
 			h.events <- taskUpdated("task-1", "TASK_RUNNING")
 			h.events <- taskAdded("task-2", scalar(usd, 1))
-			wantStates(t, h,
-				map[string]float64{tau: 38, usd: 50},
-				map[string]float64{tau: 18, usd: 48},
-				map[string]float64{tau: 18, usd: 47},
-			)
+			waitReserved(t, l, usd, "task-2")
 			if e := l.Snapshot().Pools[tau].Tasks["task-1"]; e.Settled {
 				t.Fatalf("TASK_RUNNING closed the reservation: %+v", e)
 			}
+			wantStates(t, h, map[string]float64{tau: 38, usd: 50})
 
-			// The terminal update closes the reservation and leaves the
-			// balance at 18.
+			// The terminal update closes the synced reservation. Its balance
+			// stays 18, and both totals drop by the ended task's
+			// reservations because the allocator no longer subtracts them.
+			// task-2 still runs, so its 1 stays in the unsynced total.
 			h.events <- taskUpdated("task-1", state)
+			wantStates(t, h,
+				map[string]float64{tau: 38, usd: 50},
+				map[string]float64{tau: 18, usd: 48},
+			)
 			if e := waitClosed(t, l, "task-1"); !e.Released || e.Actual != 20 {
 				t.Fatalf("synced pool entry = %+v, want released with actual 20", e)
 			}
-			if bal, _ := l.Balance(tau); bal != 18 {
+			if bal := tauBalance(t, l); bal != 18 {
 				t.Fatalf("balance after %s = %v, want 18", state, bal)
 			}
-			// The unsynced pool's reservation stays open until /settle.
-			if e := l.Snapshot().Pools[usd].Tasks["task-1"]; e.Settled || e.Reserved != 2 {
-				t.Fatalf("unsynced pool entry = %+v, want unsettled reservation of 2", e)
+			// The unsynced pool's reservation stays open until /settle and
+			// is marked ended.
+			if e := l.Snapshot().Pools[usd].Tasks["task-1"]; e.Settled || e.Reserved != 2 || !e.Ended {
+				t.Fatalf("unsynced pool entry = %+v, want an ended, unsettled reservation of 2", e)
 			}
 			if n, _ := q.seen(); n != 1 {
 				t.Fatalf("endpoint was read %d times, want 1", n)
@@ -832,11 +877,126 @@ func TestSyncedPoolClosesReservationWhenTaskEnds(t *testing.T) {
 			wantStates(t, h,
 				map[string]float64{tau: 38, usd: 50},
 				map[string]float64{tau: 18, usd: 48},
-				map[string]float64{tau: 18, usd: 47},
-				map[string]float64{tau: 30, usd: 47},
+				map[string]float64{tau: 30, usd: 48},
 			)
 		})
 	}
+}
+
+// An unsynced pool's reservation stays subtracted from the balance until
+// /settle. It is part of the advertised total only while the task runs.
+func TestUnsyncedPoolAdvertisesReservationWhileTaskRuns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	open := func() (*harness, *ledger.Ledger) {
+		l, err := ledger.OpenPools(path, []ledger.PoolSpec{{Resource: usd, Initial: 100, Cap: 100}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return startHarness(t, l, Config{}, io.Discard), l
+	}
+	usdBalance := func(l *ledger.Ledger) float64 {
+		bal, err := l.Balance(usd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bal
+	}
+
+	t.Run("task ends", func(t *testing.T) {
+		h, l := open()
+		// Reserving 25 lowers the balance to 75 and leaves the total at
+		// 100, of which the allocator counts 25 as allocated.
+		h.events <- taskAdded("task-1", scalar(usd, 25))
+		waitReserved(t, l, usd, "task-1")
+		if bal := usdBalance(l); bal != 75 {
+			t.Fatalf("balance = %v, want 75", bal)
+		}
+		wantStates(t, h, map[string]float64{usd: 100})
+
+		// The task ends unsettled. The allocation is gone, so the total
+		// drops to the balance.
+		h.events <- taskUpdated("task-1", "TASK_FINISHED")
+		wantStates(t, h, map[string]float64{usd: 100}, map[string]float64{usd: 75})
+		if e := l.Snapshot().Pools[usd].Tasks["task-1"]; e.Settled || !e.Ended {
+			t.Fatalf("entry = %+v, want ended and unsettled", e)
+		}
+	})
+
+	// A restart keeps the ended mark: the total is still the balance, and
+	// /settle then returns the unused 7.
+	h, l := open()
+	wantStates(t, h, map[string]float64{usd: 75})
+	code, body := h.post("/settle", `{"task_id":"task-1","actual":18}`)
+	if code != http.StatusOK || body["delta"] != 7.0 || body["balance"] != 82.0 {
+		t.Fatalf("/settle = HTTP %d %v, want 200 delta 7 balance 82", code, body)
+	}
+	wantStates(t, h, map[string]float64{usd: 75}, map[string]float64{usd: 82})
+
+	// A settlement while the task still runs takes the reservation out of
+	// the total at once: 82 - 10 reserved + 6 unused = 78.
+	h.events <- taskAdded("task-2", scalar(usd, 10))
+	waitReserved(t, l, usd, "task-2")
+	code, body = h.post("/settle", `{"task_id":"task-2","actual":4}`)
+	if code != http.StatusOK || body["balance"] != 78.0 {
+		t.Fatalf("/settle of a running task = HTTP %d %v, want 200 balance 78", code, body)
+	}
+	wantStates(t, h,
+		map[string]float64{usd: 75},
+		map[string]float64{usd: 82},
+		map[string]float64{usd: 78},
+	)
+}
+
+// The allocator subtracts a running task's allocation from the advertised
+// total, so the total must not have the reservation subtracted as well.
+func TestSyncedPoolAdvertisesExternalFigureWhileTaskRuns(t *testing.T) {
+	h, l, q := syncedHarness(t, "")
+	q.set(func(q *quotaServer) { q.used = 67 })
+	h.p.syncPool(context.Background(), tau, q.poller(t))
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 33, usd: 50},
+	)
+
+	// One running task reserves 5 of the 33 remaining. The ledger balance
+	// is 28 and the node keeps a total of 33, of which the allocator counts
+	// 5 as used.
+	h.events <- taskAdded("task-1", scalar(tau, 5))
+	waitReserved(t, l, tau, "task-1")
+	if bal := tauBalance(t, l); bal != 28 {
+		t.Fatalf("balance = %v, want 28", bal)
+	}
+	if got := h.states(); len(got) != 2 {
+		t.Fatalf("the reservation changed the advertised total: %v", got)
+	}
+	// A read that still reports 33 changes nothing either.
+	h.p.syncPool(context.Background(), tau, q.poller(t))
+	if got := h.states(); len(got) != 2 {
+		t.Fatalf("an unchanged read changed the advertised total: %v", got)
+	}
+
+	// A read below the reservation advertises the external figure: 3
+	// remaining with 5 reserved is a total of 3, not 0.
+	q.set(func(q *quotaServer) { q.used = 97 })
+	h.p.syncPool(context.Background(), tau, q.poller(t))
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 33, usd: 50},
+		map[string]float64{tau: 3, usd: 50},
+	)
+	if bal := tauBalance(t, l); bal != 0 {
+		t.Fatalf("balance = %v, want 0", bal)
+	}
+
+	// When the task ends the total falls to the balance, which is zero, so
+	// the pool is left out of the UPDATE_STATE.
+	h.events <- taskUpdated("task-1", "TASK_FINISHED")
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 33, usd: 50},
+		map[string]float64{tau: 3, usd: 50},
+		map[string]float64{usd: 50},
+	)
 }
 
 func TestSettleAfterAutomaticCloseChangesNothing(t *testing.T) {
@@ -844,15 +1004,18 @@ func TestSettleAfterAutomaticCloseChangesNothing(t *testing.T) {
 	h.events <- taskAdded("task-1", scalar(tau, 20))
 	h.events <- taskUpdated("task-1", "TASK_FINISHED")
 	waitClosed(t, l, "task-1")
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 18, usd: 50},
+	)
 
 	code, body := h.post("/settle", fmt.Sprintf(`{"task_id":"task-1","actual":5,"resource":%q}`, tau))
 	if code != http.StatusOK || body["delta"] != 0.0 || body["balance"] != 18.0 {
 		t.Fatalf("/settle after the terminal update = HTTP %d %v, want 200 delta 0 balance 18", code, body)
 	}
-	wantStates(t, h,
-		map[string]float64{tau: 38, usd: 50},
-		map[string]float64{tau: 18, usd: 50},
-	)
+	if got := h.states(); len(got) != 2 {
+		t.Fatalf("/settle after the terminal update sent an UPDATE_STATE: %v", got)
+	}
 	if e := l.Snapshot().Pools[tau].Tasks["task-1"]; !e.Released || e.Actual != 20 {
 		t.Fatalf("entry = %+v, want the automatic close kept", e)
 	}
@@ -861,26 +1024,30 @@ func TestSettleAfterAutomaticCloseChangesNothing(t *testing.T) {
 func TestTerminalUpdateAfterSettleChangesNothing(t *testing.T) {
 	h, l, _ := syncedHarness(t, "")
 	h.events <- taskAdded("task-1", scalar(tau, 20))
-	wantStates(t, h,
-		map[string]float64{tau: 38, usd: 50},
-		map[string]float64{tau: 18, usd: 50},
-	)
+	waitReserved(t, l, tau, "task-1")
 
+	// The settlement returns 15 and stops counting the reservation as
+	// running, so the total goes from 38 to the balance, 33.
 	code, body := h.post("/settle", fmt.Sprintf(`{"task_id":"task-1","actual":5,"resource":%q}`, tau))
 	if code != http.StatusOK || body["delta"] != 15.0 || body["balance"] != 33.0 {
 		t.Fatalf("/settle = HTTP %d %v, want 200 delta 15 balance 33", code, body)
 	}
 
 	// The terminal update finds the task settled. The debit that follows it
-	// on the stream produces the next UPDATE_STATE, from 33.
+	// on the stream proves it was processed; neither changes the total.
 	h.events <- taskUpdated("task-1", "TASK_FINISHED")
 	h.events <- taskAdded("task-2", scalar(tau, 1))
+	waitReserved(t, l, tau, "task-2")
 	wantStates(t, h,
 		map[string]float64{tau: 38, usd: 50},
-		map[string]float64{tau: 18, usd: 50},
 		map[string]float64{tau: 33, usd: 50},
-		map[string]float64{tau: 32, usd: 50},
 	)
+	if got := h.states(); len(got) != 2 {
+		t.Fatalf("UPDATE_STATE sequence = %v, want two states", got)
+	}
+	if bal := tauBalance(t, l); bal != 32 {
+		t.Fatalf("balance = %v, want 32", bal)
+	}
 	if e := l.Snapshot().Pools[tau].Tasks["task-1"]; e.Released || e.Actual != 5 {
 		t.Fatalf("entry = %+v, want the explicit settlement kept", e)
 	}
@@ -890,28 +1057,37 @@ func TestReservationIsClosedAfterRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 
 	t.Run("reserve", func(t *testing.T) {
-		h, _, _ := syncedHarness(t, path)
+		h, l, _ := syncedHarness(t, path)
 		h.events <- taskAdded("task-1", scalar(tau, 20))
-		wantStates(t, h,
-			map[string]float64{tau: 38, usd: 50},
-			map[string]float64{tau: 18, usd: 50},
-		)
+		waitReserved(t, l, tau, "task-1")
+		wantStates(t, h, map[string]float64{tau: 38, usd: 50})
 	})
 
 	// A new process loads the checkpoint. Its first read subtracts the
-	// reservation the checkpoint kept, and the terminal update closes it.
+	// reservation the checkpoint kept from the balance, and the total is the
+	// external figure while the task runs.
 	h, l, q := syncedHarness(t, path)
 	if e := l.Snapshot().Pools[tau].Tasks["task-1"]; e.Settled || e.Reserved != 20 {
 		t.Fatalf("entry after restart = %+v, want unsettled reservation of 20", e)
 	}
-	wantStates(t, h, map[string]float64{tau: 18, usd: 50})
+	wantStates(t, h, map[string]float64{tau: 38, usd: 50})
+	if bal := tauBalance(t, l); bal != 18 {
+		t.Fatalf("balance after restart = %v, want 18", bal)
+	}
+
+	// The terminal update closes the reservation and the total drops to 18.
 	h.events <- taskUpdated("task-1", "TASK_FINISHED")
 	waitClosed(t, l, "task-1")
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 18, usd: 50},
+	)
 
 	// The next read is applied without the closed reservation.
 	q.set(func(q *quotaServer) { q.used = 70 })
 	h.p.syncPool(context.Background(), tau, q.poller(t))
 	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
 		map[string]float64{tau: 18, usd: 50},
 		map[string]float64{tau: 30, usd: 50},
 	)
@@ -972,16 +1148,16 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 	// the unsynced pool.
 	h.events <- taskAdded("task-a", scalar(tau, 20))
 	h.events <- taskAdded("task-b", scalar(tau, 5), scalar(usd, 2))
+	h.events <- taskAdded("task-u", scalar(usd, 4))
 	h.events <- taskAdded("task-c", scalar(tau, 3))
-	wantStates(t, h,
-		map[string]float64{tau: 38, usd: 50},
-		map[string]float64{tau: 18, usd: 50},
-		map[string]float64{tau: 13, usd: 48},
-		map[string]float64{tau: 10, usd: 48},
-	)
+	waitReserved(t, l, tau, "task-c")
+	wantStates(t, h, map[string]float64{tau: 38, usd: 50})
+	if bal := tauBalance(t, l); bal != 10 {
+		t.Fatalf("balance = %v, want 10", bal)
+	}
 
-	// While it is down: task-a finishes, task-c keeps running and task-d is
-	// launched. The new snapshot does not list task-b at all.
+	// While it is down: task-a and task-u finish, task-c keeps running and
+	// task-d is launched. The new snapshot does not list task-b at all.
 	h.mu.Lock()
 	h.snapshot = subscribed(
 		[]map[string]any{
@@ -990,6 +1166,7 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 		},
 		[]map[string]any{
 			snapshotTask("task-a", "TASK_FINISHED", scalar(tau, 20)),
+			snapshotTask("task-u", "TASK_FINISHED", scalar(usd, 4)),
 			snapshotTask("task-old", "TASK_FINISHED", scalar(tau, 50)),
 		},
 	)
@@ -1000,15 +1177,19 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 	// The snapshot debits task-d only: task-c is not debited again and the
 	// ended task-old, which the ledger never held, is not debited at all.
 	// A TASK_ADDED on the new stream is debited.
+	// The totals change twice: task-a's reservation of 20 is closed in the
+	// synced pool, and task-u's 4 is marked ended in the unsynced pool.
+	// Both stop being counted as running.
 	h.events <- taskAdded("task-e", scalar(tau, 1))
+	waitReserved(t, l, tau, "task-e")
 	wantStates(t, h,
 		map[string]float64{tau: 38, usd: 50},
 		map[string]float64{tau: 18, usd: 50},
-		map[string]float64{tau: 13, usd: 48},
-		map[string]float64{tau: 10, usd: 48},
-		map[string]float64{tau: 8, usd: 48},
-		map[string]float64{tau: 7, usd: 48},
+		map[string]float64{tau: 18, usd: 46},
 	)
+	if bal := tauBalance(t, l); bal != 7 {
+		t.Fatalf("balance = %v, want 7", bal)
+	}
 
 	// The reservation of the ended task is settled as spent in the synced
 	// pool; the balance was not raised for it. The task the snapshot does
@@ -1025,16 +1206,25 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 	if _, ok := snap.Pools[tau].Tasks["task-old"]; ok {
 		t.Fatal("an ended task the ledger never held was debited from the snapshot")
 	}
-	// The unsynced pool still waits for /settle.
-	if e := snap.Pools[usd].Tasks["task-b"]; e.Settled || e.Reserved != 2 {
-		t.Fatalf("unsynced entry of task-b = %+v, want unsettled reservation of 2", e)
+	// The unsynced pool still waits for /settle. Its ended task is marked,
+	// and the one the snapshot does not list is not.
+	if e := snap.Pools[usd].Tasks["task-b"]; e.Settled || e.Ended || e.Reserved != 2 {
+		t.Fatalf("unsynced entry of task-b = %+v, want a running, unsettled reservation of 2", e)
+	}
+	if e := snap.Pools[usd].Tasks["task-u"]; e.Settled || !e.Ended || e.Reserved != 4 {
+		t.Fatalf("unsynced entry of task-u = %+v, want an ended, unsettled reservation of 4", e)
 	}
 
-	// The next read subtracts the four open reservations: 30 - 11.
+	// The next read reports 30. The balance has the four open reservations
+	// subtracted, 30 - 11, and the total is the 30 the allocator subtracts
+	// those four allocations from.
 	q.set(func(q *quotaServer) { q.used = 70 })
 	h.p.syncPool(context.Background(), tau, q.poller(t))
-	if got := h.waitStates(7)[6]; !reflect.DeepEqual(got, map[string]float64{tau: 19, usd: 48}) {
-		t.Fatalf("UPDATE_STATE after the next read = %v, want %s=19", got, tau)
+	if got := h.waitStates(4)[3]; !reflect.DeepEqual(got, map[string]float64{tau: 30, usd: 46}) {
+		t.Fatalf("UPDATE_STATE after the next read = %v, want %s=30", got, tau)
+	}
+	if bal := tauBalance(t, l); bal != 19 {
+		t.Fatalf("balance after the next read = %v, want 19", bal)
 	}
 
 	out := logs.String()

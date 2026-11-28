@@ -104,6 +104,10 @@ type Provider struct {
 	// controllerBackoffMax, held per provider so tests can shorten them.
 	ctrlBackoffInitial time.Duration
 	ctrlBackoffMax     time.Duration
+	// advLast is the state the node last accepted in an UPDATE_STATE on the
+	// current subscription, or nil before the first one. Advertise sends
+	// nothing when the totals equal it. Guarded by advMu.
+	advLast map[string]float64
 	// advPending is true while the node may hold balances older than the
 	// ledger's: the most recent UPDATE_STATE failed. Guarded by advMu.
 	advPending bool
@@ -276,6 +280,18 @@ func (p *Provider) postJSON(ctx context.Context, url string, payload any, stream
 	return resp.StatusCode, string(raw), nil
 }
 
+func equalTotals(a, b map[string]float64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, v := range a {
+		if w, ok := b[name]; !ok || w != v {
+			return false
+		}
+	}
+	return true
+}
+
 // formatBalances renders pool balances in name order for log lines.
 func (p *Provider) formatBalances(balances map[string]float64) string {
 	parts := make([]string, 0, len(p.resources))
@@ -285,8 +301,20 @@ func (p *Provider) formatBalances(balances map[string]float64) string {
 	return strings.Join(parts, " ")
 }
 
-// Advertise pushes every pool's current balance to medios-node in one
-// UPDATE_STATE: one scalar resource per pool with a positive balance.
+// resetAdvertised forgets what the node last accepted, so the next Advertise
+// sends an UPDATE_STATE whatever the totals are. Run calls it on each
+// SUBSCRIBED, because a new subscription starts without the earlier state.
+func (p *Provider) resetAdvertised() {
+	p.advMu.Lock()
+	defer p.advMu.Unlock()
+	p.advLast = nil
+}
+
+// Advertise pushes every pool's total to medios-node in one UPDATE_STATE: one
+// scalar resource per pool with a positive total. The total is what the
+// broker's allocator subtracts allocations from, so it includes the
+// reservations of running tasks (see ledger.Totals). Nothing is sent when the totals
+// equal the ones the node last accepted.
 func (p *Provider) Advertise(ctx context.Context, reason string) error {
 	p.advMu.Lock()
 	defer p.advMu.Unlock()
@@ -299,7 +327,10 @@ func (p *Provider) Advertise(ctx context.Context, reason string) error {
 		return nil
 	}
 
-	balances := p.ledger.Balances()
+	balances := p.ledger.Totals()
+	if !p.advPending && p.advLast != nil && equalTotals(p.advLast, balances) {
+		return nil
+	}
 	resources := []map[string]any{}
 	for _, name := range p.resources {
 		if bal := balances[name]; bal > 0 {
@@ -333,6 +364,7 @@ func (p *Provider) Advertise(ctx context.Context, reason string) error {
 		return fmt.Errorf("UPDATE_STATE returned HTTP %d: %s", st, body)
 	}
 	p.advPending = false
+	p.advLast = balances
 	p.logger.Printf("UPDATE_STATE %s (%s)", p.formatBalances(balances), reason)
 	return nil
 }
@@ -386,10 +418,11 @@ func (p *Provider) Settle(ctx context.Context, resource, taskID string, actual f
 	if err != nil {
 		return delta, bal, err
 	}
-	if delta != 0 {
-		if err := p.Advertise(ctx, fmt.Sprintf("settled task %s in %s actual=%.6g delta=%+.6g", taskID, resource, actual, delta)); err != nil {
-			return delta, bal, err
-		}
+	// A settlement changes a pool's total even when it releases nothing,
+	// because the reservation stops being counted as running. Advertise
+	// sends nothing if the totals are the ones the node already has.
+	if err := p.Advertise(ctx, fmt.Sprintf("settled task %s in %s actual=%.6g delta=%+.6g", taskID, resource, actual, delta)); err != nil {
+		return delta, bal, err
 	}
 	return delta, bal, nil
 }
@@ -732,6 +765,16 @@ func (p *Provider) taskEnded(ctx context.Context, taskID, state string) {
 		p.settleProvisioned(ctx, taskID, state)
 	}
 	p.releaseSynced(taskID, state)
+	// A reservation still unsettled here waits for /settle: an unsynced
+	// pool's, or the provisioner pool's after a failed settlement. The task
+	// no longer holds an allocation, so the reservation is marked ended and
+	// leaves the pool's total, as the ones closed above do.
+	if _, err := p.ledger.MarkEnded(taskID); err != nil {
+		p.logger.Printf("marking task %s ended failed: %v", taskID, err)
+	}
+	if err := p.Advertise(ctx, fmt.Sprintf("task %s ended (%s)", taskID, state)); err != nil && ctx.Err() == nil {
+		p.logger.Printf("advertise error after task %s ended: %v", taskID, err)
+	}
 }
 
 // applyTaskSnapshot brings the ledger up to date with the task snapshot the
@@ -781,11 +824,17 @@ func (p *Provider) applyTaskSnapshot(ctx context.Context, tasks *ctrlTasks) {
 		}
 	}
 
+	// endedOpen holds tasks already marked ended that wait for /settle. They
+	// are not reported as absent from the snapshot.
 	open := make(map[string]bool)
+	endedOpen := make(map[string]bool)
 	for _, pool := range p.ledger.Snapshot().Pools {
 		for id, entry := range pool.Tasks {
 			if !entry.Settled && entry.Reserved > 0 && !live[id] {
 				open[id] = true
+				if entry.Ended {
+					endedOpen[id] = true
+				}
 			}
 		}
 	}
@@ -793,7 +842,7 @@ func (p *Provider) applyTaskSnapshot(ctx context.Context, tasks *ctrlTasks) {
 	for id := range open {
 		if _, ok := ended[id]; ok {
 			closed = append(closed, id)
-		} else {
+		} else if !endedOpen[id] {
 			absent = append(absent, id)
 		}
 	}
@@ -834,9 +883,11 @@ func (p *Provider) settleProvisioned(ctx context.Context, taskID, state string) 
 // The balance is left where it is: the external reading is the record of what
 // the task spent, and the next read sets the balance from it without
 // subtracting this reservation. Returning the reservation at once would
-// advertise capacity the task may have used. Nothing is advertised, because
-// no balance changes. Unsynced pools are left alone: their reservations stay
-// open until /settle reports the spend. The provisioner's pool is settled by
+// advertise capacity the task may have used. The pool's advertised total
+// drops by the reservation, to the balance, because the allocator no longer
+// subtracts the ended task's allocation; taskEnded advertises it. Unsynced
+// pools are left alone: their reservations stay open until /settle reports
+// the spend. The provisioner's pool is settled by
 // settleProvisioned.
 func (p *Provider) releaseSynced(taskID, state string) {
 	for _, name := range p.resources {
@@ -935,6 +986,7 @@ func (p *Provider) Run(ctx context.Context) error {
 				return fmt.Errorf("checkpoint provider_id: %w", err)
 			}
 			p.logger.Printf("subscribed provider_id=%s %s", pid, p.formatBalances(p.ledger.Balances()))
+			p.resetAdvertised()
 			if err := p.Advertise(subCtx, "initial"); err != nil {
 				return err
 			}

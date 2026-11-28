@@ -653,3 +653,63 @@ func TestReleaseTaskClosesReservationWithoutRaisingBalance(t *testing.T) {
 		t.Fatalf("SettleTask after release = (%v, %v, %v), want (0, 30, nil)", delta, bal, err)
 	}
 }
+
+func TestTotalsCountRunningReservationsOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	l, err := OpenPools(path, []PoolSpec{{Resource: "q", Initial: 50, Cap: 50}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := func(l *Ledger) float64 { return l.Totals()["q"] }
+
+	// A running reservation is in the total and not in the balance.
+	if _, _, err := reserve(t, l, "q", "a", 20); err != nil {
+		t.Fatal(err)
+	}
+	if bal := mustBalance(t, l, "q"); bal != 30 || total(l) != 50 {
+		t.Fatalf("balance %v total %v, want 30 and 50", bal, total(l))
+	}
+
+	// A task launched beyond the balance leaves a deficit of 25. The total
+	// is what the pool held, 50, not the 75 allocated.
+	if _, err := l.DebitMany("b", map[string]float64{"q": 55}); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.Snapshot().Pools["q"]; got.Balance != 0 || got.Deficit != 25 || total(l) != 50 {
+		t.Fatalf("pool = %+v total %v, want balance 0 deficit 25 total 50", got, total(l))
+	}
+
+	// Ended reservations leave the total and stay out of the balance.
+	if changed, err := l.MarkEnded("a"); err != nil || !changed {
+		t.Fatalf("MarkEnded(a) = %v, %v; want true, nil", changed, err)
+	}
+	if got := total(l); got != 30 {
+		t.Fatalf("total with b running = %v, want 30", got)
+	}
+	if changed, err := l.MarkEnded("b"); err != nil || !changed {
+		t.Fatalf("MarkEnded(b) = %v, %v; want true, nil", changed, err)
+	}
+	if changed, err := l.MarkEnded("b"); err != nil || changed {
+		t.Fatalf("second MarkEnded(b) = %v, %v; want false, nil", changed, err)
+	}
+	if bal := mustBalance(t, l, "q"); bal != 0 || total(l) != 0 {
+		t.Fatalf("balance %v total %v, want 0 and 0", bal, total(l))
+	}
+
+	// A refill is in the total at once; the deficit does not take it.
+	if _, _, err := l.Refill("q", 1.5); err != nil {
+		t.Fatal(err)
+	}
+	if got := total(l); got != 1.5 {
+		t.Fatalf("total after refill = %v, want 1.5", got)
+	}
+
+	// The ended marks are in the checkpoint.
+	reopened, err := OpenPools(path, []PoolSpec{{Resource: "q", Initial: 50, Cap: 50}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := total(reopened); got != 1.5 {
+		t.Fatalf("total after reopen = %v, want 1.5", got)
+	}
+}

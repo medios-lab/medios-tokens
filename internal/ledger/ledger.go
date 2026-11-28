@@ -46,7 +46,11 @@ type TaskEntry struct {
 	Settled  bool    `json:"settled"`
 	Actual   float64 `json:"actual,omitempty"`
 	Released bool    `json:"released,omitempty"`
-	KeyHash  string  `json:"key_hash,omitempty"`
+	// Ended is true once the task is known to have ended while its
+	// reservation is still unsettled. Such a reservation stays subtracted
+	// from the balance and is not counted as running in Totals.
+	Ended   bool   `json:"ended,omitempty"`
+	KeyHash string `json:"key_hash,omitempty"`
 }
 
 // PoolSnapshot is the state of one named consumable scalar.
@@ -356,6 +360,60 @@ func (l *Ledger) Balances() map[string]float64 {
 		out[name] = pool.Balance
 	}
 	return out
+}
+
+// Totals returns the amount to advertise for each pool.
+//
+// The broker's allocator computes what it can offer as the advertised total
+// less what is offered or allocated, so a running task's allocation is
+// subtracted there. Balance has that task's reservation subtracted too. The
+// total is therefore the balance plus the reservations the allocator will
+// subtract, which are those of unsettled tasks not marked ended:
+//
+//	total = balance + max(0, sum(Reserved of running tasks) - deficit)
+//
+// The deficit is the part of the reservations the balance never covered, so
+// it is taken from them and not from the balance.
+func (l *Ledger) Totals() map[string]float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]float64, len(l.snap.Pools))
+	for name, pool := range l.snap.Pools {
+		var running float64
+		for _, entry := range pool.Tasks {
+			if !entry.Settled && !entry.Ended {
+				running += entry.Reserved
+			}
+		}
+		out[name] = round6(pool.Balance + math.Max(0, running-pool.Deficit))
+	}
+	return out
+}
+
+// MarkEnded records that taskID has ended in every pool where it still has
+// an unsettled reservation, and reports whether any entry changed. The
+// reservations stay subtracted from the balances until they are settled.
+func (l *Ledger) MarkEnded(taskID string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var pools []string
+	for name, pool := range l.snap.Pools {
+		if e, ok := pool.Tasks[taskID]; ok && !e.Settled && !e.Ended && e.Reserved > 0 {
+			pools = append(pools, name)
+		}
+	}
+	if len(pools) == 0 {
+		return false, nil
+	}
+	err := l.updateLocked(func(s *Snapshot) error {
+		for _, name := range pools {
+			e := s.Pools[name].Tasks[taskID]
+			e.Ended = true
+			s.Pools[name].Tasks[taskID] = e
+		}
+		return nil
+	})
+	return err == nil, err
 }
 
 // CanAuthorize reports whether a PUBLISH_RESOURCES gate may proceed for the
