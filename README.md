@@ -147,6 +147,8 @@ so capacity already promised to running tasks is not offered a second time. Unti
 
 The advertised balance can be higher than the true one in two cases. If the endpoint reports a task's spend some time after the task settles, reads in between see the reservation gone and the spend not yet counted. Spend against the same external quota that did not pass through a task reservation is visible only after the next read.
 
+When a read reports less than the unsettled reservations, the balance is zero and the ledger records the uncovered amount as the pool's `deficit` in the checkpoint. A task that then settles below its reservation pays the deficit down first, so the balance rises only by what the external reading covers. If the node rejects an `UPDATE_STATE`, the next read of any synced pool sends the current balances again, whether or not that read changed anything.
+
 When a read fails (connection error, timeout, a status other than 200, or a response without the configured paths), the provider logs the failure and keeps advertising the last balance. There is no limit on how long it does so. The credential value is never written to the log or the state file.
 
 `POST /refill` on a synced pool returns HTTP 409.

@@ -84,6 +84,9 @@ type Provider struct {
 	// advMu serializes Advertise so the balances read from the ledger and
 	// the UPDATE_STATE that carries them reach the node in the same order.
 	advMu sync.Mutex
+	// advPending is true while the node may hold balances older than the
+	// ledger's: the most recent UPDATE_STATE failed. Guarded by advMu.
+	advPending bool
 }
 
 func New(cfg Config, l *ledger.Ledger, logger *log.Logger) (*Provider, error) {
@@ -279,11 +282,14 @@ func (p *Provider) Advertise(ctx context.Context, reason string) error {
 	endpoint := strings.TrimRight(p.cfg.NodeURL, "/") + "/api/v1/resource_provider"
 	st, body, err := p.postJSON(ctx, endpoint, call, sid)
 	if err != nil {
+		p.advPending = true
 		return err
 	}
 	if st != http.StatusAccepted {
+		p.advPending = true
 		return fmt.Errorf("UPDATE_STATE returned HTTP %d: %s", st, body)
 	}
+	p.advPending = false
 	p.logger.Printf("UPDATE_STATE %s (%s)", p.formatBalances(balances), reason)
 	return nil
 }
@@ -345,10 +351,34 @@ func (p *Provider) Settle(ctx context.Context, resource, taskID string, actual f
 	return delta, bal, nil
 }
 
+// advertisePending reports whether the last UPDATE_STATE failed.
+func (p *Provider) advertisePending() bool {
+	p.advMu.Lock()
+	defer p.advMu.Unlock()
+	return p.advPending
+}
+
 // syncPool reads one pool's external balance, applies it to the ledger and
-// advertises if the balance or cap changed. A failed read or an unusable
-// response leaves the pool's balance as it was.
+// advertises if the pool changed. It also advertises when the previous
+// UPDATE_STATE failed, whatever this read returned, so the node does not keep
+// balances older than the ledger's after a failed call.
 func (p *Provider) syncPool(ctx context.Context, resource string, src BalanceSource) {
+	reason, changed := p.reconcilePool(ctx, resource, src)
+	if !changed {
+		if !p.advertisePending() {
+			return
+		}
+		reason = "retry after failed UPDATE_STATE"
+	}
+	if err := p.Advertise(ctx, reason); err != nil && ctx.Err() == nil {
+		p.logger.Printf("advertise error after sync of %s: %v", resource, err)
+	}
+}
+
+// reconcilePool reads one pool's external balance and applies it to the
+// ledger. A failed read or an unusable response leaves the pool as it was.
+// It returns whether the pool changed and the reason to advertise with.
+func (p *Provider) reconcilePool(ctx context.Context, resource string, src BalanceSource) (string, bool) {
 	for attempt := 1; attempt <= maxSyncAttempts; attempt++ {
 		epoch := p.ledger.SettleEpoch(resource)
 		reading, err := src.Fetch(ctx)
@@ -357,7 +387,7 @@ func (p *Provider) syncPool(ctx context.Context, resource string, src BalanceSou
 				bal, _ := p.ledger.Balance(resource)
 				p.logger.Printf("balance sync for %s failed, keeping balance %.6g: %v", resource, bal, err)
 			}
-			return
+			return "", false
 		}
 		changed, err := p.ledger.Reconcile(resource, epoch, reading)
 		if errors.Is(err, ledger.ErrStaleReading) {
@@ -365,18 +395,13 @@ func (p *Provider) syncPool(ctx context.Context, resource string, src BalanceSou
 		}
 		if err != nil {
 			p.logger.Printf("balance sync for %s not applied: %v", resource, err)
-			return
+			return "", false
 		}
-		if changed {
-			reason := fmt.Sprintf("synced %s external available=%.6g", resource, reading.Available)
-			if err := p.Advertise(ctx, reason); err != nil && ctx.Err() == nil {
-				p.logger.Printf("advertise error after sync of %s: %v", resource, err)
-			}
-		}
-		return
+		return fmt.Sprintf("synced %s external available=%.6g", resource, reading.Available), changed
 	}
 	p.logger.Printf("balance sync for %s discarded %d readings taken across task settlements; retrying next interval",
 		resource, maxSyncAttempts)
+	return "", false
 }
 
 // writeJSON sends v as a JSON response body.
@@ -533,7 +558,8 @@ func formatRequests(reqs map[string]float64) string {
 // All pools are debited in one ledger update. The task is already running
 // when TASK_ADDED arrives, so when a pool holds less than the task carries
 // (its balance dropped after the offer went out) the shortfall is logged and
-// the reservation is still recorded, with that pool's balance floored at zero.
+// the reservation is still recorded: that pool's balance drops to zero and
+// the ledger keeps the shortfall as the pool's deficit.
 func (p *Provider) debitTask(ctx context.Context, taskID string, reqs map[string]float64) {
 	changed, err := p.ledger.ReserveMany(taskID, reqs)
 	if errors.Is(err, ledger.ErrInsufficient) {

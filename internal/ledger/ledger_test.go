@@ -515,3 +515,93 @@ func TestSnapshotIsIndependentUnderConcurrency(t *testing.T) {
 		}
 	}
 }
+
+func TestSettleAfterReconcileBelowReservations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	specs := []PoolSpec{{Resource: "q", Initial: 100, Cap: 100}}
+	l, err := OpenPools(path, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserve(t, l, "q", "a", 40)
+	reserve(t, l, "q", "b", 20)
+
+	// External: 10 remaining against 60 reserved and unsettled. The balance
+	// is floored at zero and the uncovered 50 is kept as the deficit.
+	if _, err := l.Reconcile("q", l.SettleEpoch("q"), External{Available: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.Snapshot().Pools["q"]; got.Balance != 0 || got.Deficit != 50 {
+		t.Fatalf("pool after reconcile = %+v, want balance 0 deficit 50", got)
+	}
+
+	// The deficit is checkpointed, so a restart does not release it.
+	l, err = OpenPools(path, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Releasing 40 unused pays the deficit down to 10; nothing is available.
+	if _, bal, err := l.SettleTask("q", "a", 0); err != nil || bal != 0 {
+		t.Fatalf("SettleTask(a) = balance %v, err %v; want 0, nil", bal, err)
+	}
+	// Releasing 15 more clears the remaining 10 and leaves 5: the external 10
+	// less the 5 that task b spent.
+	if _, bal, err := l.SettleTask("q", "b", 5); err != nil || bal != 5 {
+		t.Fatalf("SettleTask(b) = balance %v, err %v; want 5, nil", bal, err)
+	}
+	if got := l.Snapshot().Pools["q"]; got.Deficit != 0 {
+		t.Fatalf("deficit after settlements = %v, want 0", got.Deficit)
+	}
+}
+
+func TestSettleReleasesOnlyWhatExternalBalanceCovers(t *testing.T) {
+	l, err := OpenPools("", []PoolSpec{{Resource: "q", Initial: 100, Cap: 100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserve(t, l, "q", "a", 40)
+	if bal := mustBalance(t, l, "q"); bal != 60 {
+		t.Fatalf("balance after reserve = %v, want 60", bal)
+	}
+
+	// External spending elsewhere leaves 10 remaining; 40 is still reserved.
+	if _, err := l.Reconcile("q", l.SettleEpoch("q"), External{Available: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if bal := mustBalance(t, l, "q"); bal != 0 {
+		t.Fatalf("balance after reconcile = %v, want 0", bal)
+	}
+
+	// The task spent nothing. Only the 10 the external balance holds is
+	// released, not the 40 reserved.
+	delta, bal, err := l.SettleTask("q", "a", 0)
+	if err != nil || delta != 40 || bal != 10 {
+		t.Fatalf("SettleTask = (delta %v, balance %v, %v), want (40, 10, nil)", delta, bal, err)
+	}
+}
+
+func TestSettleAfterShortfallDebitAndRefill(t *testing.T) {
+	l, err := OpenPools("", []PoolSpec{{Resource: "q", Initial: 50, Cap: 50}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A launched task takes 75 from a pool holding 50: deficit 25.
+	if _, err := l.DebitMany("a", map[string]float64{"q": 75}); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.Snapshot().Pools["q"]; got.Balance != 0 || got.Deficit != 25 {
+		t.Fatalf("pool after debit = %+v, want balance 0 deficit 25", got)
+	}
+	// A refill is available at once and is not taken by the deficit.
+	if bal, _, err := l.Refill("q", 1.5); err != nil || bal != 1.5 {
+		t.Fatalf("Refill = balance %v, err %v; want 1.5, nil", bal, err)
+	}
+	// Releasing 5 pays the deficit down and does not lower the balance.
+	if _, bal, err := l.SettleTask("q", "a", 70); err != nil || bal != 1.5 {
+		t.Fatalf("SettleTask = balance %v, err %v; want 1.5, nil", bal, err)
+	}
+	if got := l.Snapshot().Pools["q"]; got.Deficit != 20 {
+		t.Fatalf("deficit after settlement = %v, want 20", got.Deficit)
+	}
+}

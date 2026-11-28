@@ -47,11 +47,31 @@ type TaskEntry struct {
 }
 
 // PoolSnapshot is the state of one named consumable scalar.
+//
+// Deficit is the amount by which unsettled reservations exceed what the pool
+// can cover. It arises when an external reading falls below the unsettled
+// reservations or when a launched task is debited beyond the balance. Credit
+// released by a settlement pays the deficit down before it raises Balance. A
+// refill adds to Balance and leaves the deficit, so both can be non-zero.
 type PoolSnapshot struct {
 	Balance float64              `json:"balance"`
 	Cap     float64              `json:"cap"`
+	Deficit float64              `json:"deficit,omitempty"`
 	Frozen  bool                 `json:"frozen,omitempty"`
 	Tasks   map[string]TaskEntry `json:"tasks"`
+}
+
+// setPosition stores a signed position (available amount less uncovered
+// reservations) as Balance, clamped at Cap, and Deficit.
+func (p *PoolSnapshot) setPosition(net float64) {
+	net = round6(net)
+	if net >= 0 {
+		p.Balance = math.Min(p.Cap, net)
+		p.Deficit = 0
+		return
+	}
+	p.Balance = 0
+	p.Deficit = -net
 }
 
 // Snapshot is the serializable checkpoint of the provider's budget ledger.
@@ -406,9 +426,10 @@ func (l *Ledger) ReserveMany(taskID string, reqs map[string]float64) (bool, erro
 }
 
 // DebitMany records taskID's reservation in every pool in reqs and reduces
-// each balance by the requested amount, flooring at zero where a pool holds
-// less. It is for a task the broker has already launched: the reservation
-// must be recorded even when the pool cannot cover it. Deduplication and
+// each balance by the requested amount. Where a pool holds less, its balance
+// drops to zero and the shortfall is added to its Deficit. It is for a task
+// the broker has already launched: the reservation must be recorded even when
+// the pool cannot cover it. Deduplication and
 // atomicity are the same as ReserveMany.
 func (l *Ledger) DebitMany(taskID string, reqs map[string]float64) (bool, error) {
 	return l.debit(taskID, reqs, false)
@@ -458,7 +479,9 @@ func (l *Ledger) debit(taskID string, reqs map[string]float64, strict bool) (boo
 			entry := pool.Tasks[taskID]
 			entry.Reserved = amounts[name]
 			pool.Tasks[taskID] = entry
+			short := math.Max(0, round6(amounts[name]-pool.Balance))
 			pool.Balance = math.Max(0, round6(pool.Balance-amounts[name]))
+			pool.Deficit = round6(pool.Deficit + short)
 		}
 		return nil
 	})
@@ -469,7 +492,8 @@ func (l *Ledger) debit(taskID string, reqs map[string]float64, strict bool) (boo
 }
 
 // SettleTask reconciles actual consumption for a previously debited task in
-// one pool and releases any unused reservation (reserved - actual) back to the
+// one pool and releases any unused reservation (reserved - actual). The
+// released amount first pays down the pool's Deficit; the rest raises the
 // balance, clamped at Cap. Returns (deltaReleased, newBalance, err).
 func (l *Ledger) SettleTask(resource, taskID string, actual float64) (float64, float64, error) {
 	if actual < 0 {
@@ -498,7 +522,9 @@ func (l *Ledger) SettleTask(resource, taskID string, actual float64) (float64, f
 			// Overrun: deduct any extra actual spend beyond the reservation, floored at 0.
 			p.Balance = math.Max(0, round6(p.Balance+unused))
 		} else if unused > 0 {
-			p.Balance = math.Min(p.Cap, round6(p.Balance+unused))
+			pay := math.Min(unused, p.Deficit)
+			p.Deficit = round6(p.Deficit - pay)
+			p.Balance = math.Min(p.Cap, round6(p.Balance+unused-pay))
 		}
 		return nil
 	})
@@ -510,6 +536,7 @@ func (l *Ledger) SettleTask(resource, taskID string, actual float64) (float64, f
 }
 
 // Refill adds amount to one pool up to its Cap. Returns (newBalance, changed, err).
+// A refill is a grant of new budget and leaves the pool's Deficit as it is.
 func (l *Ledger) Refill(resource string, amount float64) (float64, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -546,7 +573,10 @@ func (l *Ledger) SettleEpoch(resource string) uint64 {
 // the reservations that are not yet settled:
 //
 //	balance = max(0, ext.Available - sum(Reserved of unsettled tasks))
+//	deficit = max(0, sum(Reserved of unsettled tasks) - ext.Available)
 //
+// The deficit keeps the part of the reservations the reading does not cover,
+// so a later settlement releases only what the external balance allows.
 // The unsettled sum is taken under the ledger lock at the time the reading is
 // applied, so a reservation made while the external read was in flight is
 // subtracted. epoch is the SettleEpoch sampled before the external read; if a
@@ -556,7 +586,7 @@ func (l *Ledger) SettleEpoch(resource string) uint64 {
 //
 // Cap becomes ext.Cap when the reading carries one. Otherwise Cap is kept,
 // and raised to ext.Available only when the external balance exceeds it.
-// Returns whether balance or cap changed.
+// Returns whether balance, deficit or cap changed.
 func (l *Ledger) Reconcile(resource string, epoch uint64, ext External) (bool, error) {
 	if ext.Available < 0 || (ext.HasCap && ext.Cap < 0) {
 		return false, errors.New("external balance and cap must be non-negative")
@@ -582,12 +612,14 @@ func (l *Ledger) Reconcile(resource string, epoch uint64, ext External) (bool, e
 	} else if ext.Available > capVal {
 		capVal = round6(ext.Available)
 	}
-	balance := math.Min(capVal, math.Max(0, round6(ext.Available-inflight)))
-	if balance == pool.Balance && capVal == pool.Cap {
+	next := PoolSnapshot{Cap: capVal}
+	next.setPosition(ext.Available - inflight)
+	if next.Balance == pool.Balance && next.Deficit == pool.Deficit && capVal == pool.Cap {
 		return false, nil
 	}
 	if err := l.updateLocked(func(s *Snapshot) error {
-		s.Pools[resource].Balance = balance
+		s.Pools[resource].Balance = next.Balance
+		s.Pools[resource].Deficit = next.Deficit
 		s.Pools[resource].Cap = capVal
 		return nil
 	}); err != nil {

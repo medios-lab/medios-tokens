@@ -624,3 +624,85 @@ func TestBalanceEndpointDuringConcurrentUpdates(t *testing.T) {
 		t.Fatalf("%s balance = %v, want 40 after 100 debits of 0.1", usd, bal)
 	}
 }
+
+func TestSyncPoolRetriesFailedAdvertise(t *testing.T) {
+	q := newQuotaServer()
+	defer q.Close()
+	q.set(func(q *quotaServer) { q.used = 1000 })
+
+	var mu sync.Mutex
+	failNext := true
+	var advertised []map[string]float64
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var call map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&call)
+		if call["type"] != "UPDATE_STATE" {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if failNext {
+			failNext = false
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		state := map[string]float64{}
+		for _, res := range call["update_state"].(map[string]any)["resources"].([]any) {
+			m := res.(map[string]any)
+			state[m["name"].(string)] = m["scalar"].(map[string]any)["value"].(float64)
+		}
+		advertised = append(advertised, state)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer node.Close()
+	accepted := func() []map[string]float64 {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]map[string]float64(nil), advertised...)
+	}
+
+	l := twoPoolLedger(t)
+	if err := l.SetProviderID("rp-test"); err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	src := q.poller(t)
+	p, err := New(Config{
+		NodeURL: node.URL,
+		Pools:   map[string]PoolOptions{tau: {Source: src, SyncInterval: time.Minute}},
+	}, l, log.New(logs, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	p.streamID = "stream-retry"
+	p.mu.Unlock()
+	ctx := context.Background()
+
+	// The reading moves the pool from 1000 to 0 and the node rejects the
+	// UPDATE_STATE that carries it.
+	p.syncPool(ctx, tau, src)
+	if bal, _ := l.Balance(tau); bal != 0 {
+		t.Fatalf("balance after sync = %v, want 0", bal)
+	}
+	if got := accepted(); len(got) != 0 {
+		t.Fatalf("node accepted %v, want nothing yet", got)
+	}
+	if !strings.Contains(logs.String(), "advertise error after sync") {
+		t.Fatalf("log does not record the failed advertisement: %q", logs.String())
+	}
+
+	// The same reading changes nothing in the ledger; the advertisement is
+	// sent again because the node never accepted the last one.
+	p.syncPool(ctx, tau, src)
+	want := []map[string]float64{{usd: 50}}
+	if got := accepted(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("node accepted %v, want %v", got, want)
+	}
+
+	// Once accepted, an unchanged reading sends nothing more.
+	p.syncPool(ctx, tau, src)
+	if got := accepted(); len(got) != 1 {
+		t.Fatalf("node accepted %d states after an unchanged reading, want 1", len(got))
+	}
+}
