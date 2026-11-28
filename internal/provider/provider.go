@@ -34,6 +34,22 @@ import (
 // cannot multiply requests against the external endpoint.
 const maxSyncAttempts = 2
 
+// controllerBackoffInitial is the wait before the first resubscribe to the
+// controller event stream after it ends, and the wait after any stream that
+// had connected.
+// Default, provisional: 1 s is short next to the time a task holds a
+// reservation, so few task events fall in the gap, and long enough that a
+// controller that closes streams at once is not sent a tight loop of requests.
+// Not measured against a controller restart or failover.
+const controllerBackoffInitial = 1 * time.Second
+
+// controllerBackoffMax caps the wait, which doubles after each attempt that
+// fails to connect.
+// Default, provisional: 30 s bounds how long the provider stays without task
+// events once the controller is reachable again, at two requests a minute
+// while it is not. Not measured.
+const controllerBackoffMax = 30 * time.Second
+
 // errSyncedPool is returned when a refill targets a pool whose balance is
 // read from an external endpoint; the next read would overwrite the refill.
 var errSyncedPool = errors.New("pool balance is synced from an external endpoint and cannot be refilled")
@@ -84,6 +100,10 @@ type Provider struct {
 	// advMu serializes Advertise so the balances read from the ledger and
 	// the UPDATE_STATE that carries them reach the node in the same order.
 	advMu sync.Mutex
+	// ctrlBackoffInitial and ctrlBackoffMax are controllerBackoffInitial and
+	// controllerBackoffMax, held per provider so tests can shorten them.
+	ctrlBackoffInitial time.Duration
+	ctrlBackoffMax     time.Duration
 	// advPending is true while the node may hold balances older than the
 	// ledger's: the most recent UPDATE_STATE failed. Guarded by advMu.
 	advPending bool
@@ -105,6 +125,9 @@ func New(cfg Config, l *ledger.Ledger, logger *log.Logger) (*Provider, error) {
 		resources: l.Resources(),
 		client:    &http.Client{Timeout: 15 * time.Second},
 		logger:    logger,
+
+		ctrlBackoffInitial: controllerBackoffInitial,
+		ctrlBackoffMax:     controllerBackoffMax,
 	}
 	for name, opts := range cfg.Pools {
 		if !p.hasPool(name) {
@@ -176,20 +199,40 @@ type rpEvent struct {
 	} `json:"publish_resources"`
 }
 
+// ctrlTask is the part of a controller Task message the provider reads.
+type ctrlTask struct {
+	TaskID    idVal  `json:"task_id"`
+	State     string `json:"state"`
+	Resources []struct {
+		Name       string `json:"name"`
+		Type       string `json:"type"`
+		ProviderID *idVal `json:"provider_id"`
+		Scalar     *struct {
+			Value float64 `json:"value"`
+		} `json:"scalar"`
+	} `json:"resources"`
+}
+
+// ctrlTasks is the task snapshot the controller sends when a client
+// subscribes. Tasks holds launched tasks, including ended ones whose terminal
+// status is not yet acknowledged; CompletedTasks holds ended, acknowledged
+// ones.
+type ctrlTasks struct {
+	PendingTasks     []ctrlTask `json:"pending_tasks"`
+	Tasks            []ctrlTask `json:"tasks"`
+	UnreachableTasks []ctrlTask `json:"unreachable_tasks"`
+	CompletedTasks   []ctrlTask `json:"completed_tasks"`
+}
+
 type ctrlEvent struct {
-	Type      string `json:"type"`
+	Type       string `json:"type"`
+	Subscribed *struct {
+		GetState *struct {
+			GetTasks *ctrlTasks `json:"get_tasks"`
+		} `json:"get_state"`
+	} `json:"subscribed"`
 	TaskAdded *struct {
-		Task struct {
-			TaskID    idVal `json:"task_id"`
-			Resources []struct {
-				Name       string `json:"name"`
-				Type       string `json:"type"`
-				ProviderID *idVal `json:"provider_id"`
-				Scalar     *struct {
-					Value float64 `json:"value"`
-				} `json:"scalar"`
-			} `json:"resources"`
-		} `json:"task"`
+		Task ctrlTask `json:"task"`
 	} `json:"task_added"`
 	TaskUpdated *struct {
 		State  string `json:"state"`
@@ -577,11 +620,45 @@ func (p *Provider) debitTask(ctx context.Context, taskID string, reqs map[string
 	}
 }
 
-func (p *Provider) watchController(ctx context.Context) error {
+// runControllerWatcher keeps a subscription to the controller event stream
+// open until ctx is cancelled. When the stream ends or cannot be opened it
+// waits and subscribes again. The wait starts at ctrlBackoffInitial, doubles
+// after each attempt that does not connect, up to ctrlBackoffMax, and returns
+// to ctrlBackoffInitial after a stream that connected.
+func (p *Provider) runControllerWatcher(ctx context.Context) {
+	delay := p.ctrlBackoffInitial
+	for {
+		connected, err := p.watchController(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if connected {
+			delay = p.ctrlBackoffInitial
+			p.logger.Printf("controller event stream disconnected (%v); resubscribing in %s", err, delay)
+		} else {
+			p.logger.Printf("controller event stream not connected (%v); resubscribing in %s", err, delay)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if !connected {
+			delay = min(delay*2, p.ctrlBackoffMax)
+		}
+	}
+}
+
+// watchController subscribes to the controller event stream once and handles
+// its events until the stream ends. connected reports whether the controller
+// accepted the subscription.
+func (p *Provider) watchController(ctx context.Context) (connected bool, err error) {
 	endpoint := strings.TrimRight(p.cfg.ControllerURL, "/") + "/api/v1"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader([]byte(`{"type":"SUBSCRIBE"}`)))
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -589,35 +666,34 @@ func (p *Provider) watchController(ctx context.Context) error {
 	streamClient := &http.Client{}
 	resp, err := streamClient.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("controller SUBSCRIBE returned HTTP %d: %s", resp.StatusCode, string(raw))
+		return false, fmt.Errorf("controller SUBSCRIBE returned HTTP %d: %s", resp.StatusCode, string(raw))
 	}
+	p.logger.Printf("controller event stream connected")
 
 	reader := recordio.NewReader(resp.Body)
 	for {
 		var ev ctrlEvent
 		if err := reader.Next(&ev); err != nil {
-			return err
+			return true, err
 		}
 		switch ev.Type {
+		case "SUBSCRIBED":
+			if ev.Subscribed == nil || ev.Subscribed.GetState == nil || ev.Subscribed.GetState.GetTasks == nil {
+				p.logger.Printf("controller SUBSCRIBED carries no task snapshot; open reservations are left as they are")
+				continue
+			}
+			p.applyTaskSnapshot(ctx, ev.Subscribed.GetState.GetTasks)
+
 		case "TASK_ADDED":
 			if ev.TaskAdded == nil {
 				continue
 			}
-			taskID := ev.TaskAdded.Task.TaskID.Value
-			pid := p.ledger.ProviderID()
-			reqs := make(map[string]float64)
-			for _, res := range ev.TaskAdded.Task.Resources {
-				if p.hasPool(res.Name) && res.Type == "SCALAR" &&
-					res.ProviderID != nil && res.ProviderID.Value == pid && res.Scalar != nil {
-					reqs[res.Name] += res.Scalar.Value
-				}
-			}
-			p.debitTask(ctx, taskID, reqs)
+			p.debitTask(ctx, ev.TaskAdded.Task.TaskID.Value, p.taskRequests(ev.TaskAdded.Task))
 
 		case "TASK_UPDATED":
 			if ev.TaskUpdated == nil || ev.TaskUpdated.Status == nil {
@@ -631,11 +707,105 @@ func (p *Provider) watchController(ctx context.Context) error {
 			if taskID == "" || !isTerminalTaskState(state) {
 				continue
 			}
-			if p.cfg.Provisioner != nil {
-				p.settleProvisioned(ctx, taskID, state)
-			}
-			p.releaseSynced(taskID, state)
+			p.taskEnded(ctx, taskID, state)
 		}
+	}
+}
+
+// taskRequests returns the amount a task holds of each pool this provider
+// advertises.
+func (p *Provider) taskRequests(task ctrlTask) map[string]float64 {
+	pid := p.ledger.ProviderID()
+	reqs := make(map[string]float64)
+	for _, res := range task.Resources {
+		if p.hasPool(res.Name) && res.Type == "SCALAR" &&
+			res.ProviderID != nil && res.ProviderID.Value == pid && res.Scalar != nil {
+			reqs[res.Name] += res.Scalar.Value
+		}
+	}
+	return reqs
+}
+
+// taskEnded handles a task that has reached a terminal state.
+func (p *Provider) taskEnded(ctx context.Context, taskID, state string) {
+	if p.cfg.Provisioner != nil {
+		p.settleProvisioned(ctx, taskID, state)
+	}
+	p.releaseSynced(taskID, state)
+}
+
+// applyTaskSnapshot brings the ledger up to date with the task snapshot the
+// controller sends at the start of a subscription, covering task events sent
+// while no stream was open.
+//
+// A task the snapshot lists as launched and not ended is debited; the debit
+// is once per task ID, so a task debited earlier is unchanged. A task with a
+// debited, unsettled reservation that the snapshot lists as ended is handled
+// as taskEnded handles a terminal update.
+//
+// A reservation whose task the snapshot does not list stays open and is
+// logged. Absence does not show the task ended: a controller that has just
+// taken over lists a node's tasks only after that node registers with it
+// again, and the stream that ended is often the one to the controller it
+// replaced. Closing such reservations would stop subtracting running tasks
+// from a synced pool and would revoke running tasks' provisioned keys.
+//
+// A task that was both launched and ended while no stream was open is not
+// debited: the snapshot's ended tasks include ones from before the ledger
+// existed, and debiting them would subtract amounts that were never reserved
+// from it.
+func (p *Provider) applyTaskSnapshot(ctx context.Context, tasks *ctrlTasks) {
+	live := make(map[string]bool)
+	ended := make(map[string]string)
+	for _, t := range tasks.PendingTasks {
+		live[t.TaskID.Value] = true
+	}
+	for _, t := range tasks.UnreachableTasks {
+		live[t.TaskID.Value] = true
+	}
+	for _, t := range tasks.Tasks {
+		id := t.TaskID.Value
+		if id == "" {
+			continue
+		}
+		if isTerminalTaskState(t.State) {
+			ended[id] = t.State
+			continue
+		}
+		live[id] = true
+		p.debitTask(ctx, id, p.taskRequests(t))
+	}
+	for _, t := range tasks.CompletedTasks {
+		if _, ok := ended[t.TaskID.Value]; !ok {
+			ended[t.TaskID.Value] = t.State
+		}
+	}
+
+	open := make(map[string]bool)
+	for _, pool := range p.ledger.Snapshot().Pools {
+		for id, entry := range pool.Tasks {
+			if !entry.Settled && entry.Reserved > 0 && !live[id] {
+				open[id] = true
+			}
+		}
+	}
+	var closed, absent []string
+	for id := range open {
+		if _, ok := ended[id]; ok {
+			closed = append(closed, id)
+		} else {
+			absent = append(absent, id)
+		}
+	}
+	sort.Strings(closed)
+	sort.Strings(absent)
+	for _, id := range closed {
+		p.taskEnded(ctx, id, ended[id])
+	}
+	p.logger.Printf("applied controller task snapshot: %d tasks not ended, %d ended tasks with open reservations handled", len(live), len(closed))
+	if len(absent) > 0 {
+		p.logger.Printf("controller task snapshot does not list %d tasks with open reservations, left open: %s",
+			len(absent), strings.Join(absent, ", "))
 	}
 }
 
@@ -770,11 +940,7 @@ func (p *Provider) Run(ctx context.Context) error {
 			}
 			if !started {
 				started = true
-				go func() {
-					if err := p.watchController(subCtx); err != nil && subCtx.Err() == nil {
-						p.logger.Printf("controller watcher exited: %v", err)
-					}
-				}()
+				go p.runControllerWatcher(subCtx)
 				if p.cfg.RefillInterval > 0 && p.hasRefillAmount() {
 					go func() {
 						ticker := time.NewTicker(p.cfg.RefillInterval)
