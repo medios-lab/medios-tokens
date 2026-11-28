@@ -614,9 +614,14 @@ func TestRunAdvertisesSyncedBalance(t *testing.T) {
 	if bal, _ := l.Balance(tau); bal != 6 {
 		t.Fatalf("balance = %v, want 6", bal)
 	}
-	if got := h.states(); len(got) != 2 {
-		t.Fatalf("the reservation changed the advertised total: %v", got)
-	}
+	// The next change at the endpoint follows the two totals directly: the
+	// debit sent no UPDATE_STATE in between.
+	q.set(func(q *quotaServer) { q.used = 992 })
+	wantStates(t, h,
+		map[string]float64{tau: 13, usd: 50},
+		map[string]float64{tau: 10, usd: 50},
+		map[string]float64{tau: 8, usd: 50},
+	)
 }
 
 // /balance must be readable while debits and syncs run; run with -race.
@@ -1143,6 +1148,7 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 	// the unsynced pool.
 	h.events <- taskAdded("task-a", scalar(tau, 20))
 	h.events <- taskAdded("task-b", scalar(tau, 5), scalar(usd, 2))
+	h.events <- taskAdded("task-u", scalar(usd, 4))
 	h.events <- taskAdded("task-c", scalar(tau, 3))
 	waitReserved(t, l, tau, "task-c")
 	wantStates(t, h, map[string]float64{tau: 38, usd: 50})
@@ -1150,8 +1156,8 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 		t.Fatalf("balance = %v, want 10", bal)
 	}
 
-	// While it is down: task-a finishes, task-c keeps running and task-d is
-	// launched. The new snapshot does not list task-b at all.
+	// While it is down: task-a and task-u finish, task-c keeps running and
+	// task-d is launched. The new snapshot does not list task-b at all.
 	h.mu.Lock()
 	h.snapshot = subscribed(
 		[]map[string]any{
@@ -1160,6 +1166,7 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 		},
 		[]map[string]any{
 			snapshotTask("task-a", "TASK_FINISHED", scalar(tau, 20)),
+			snapshotTask("task-u", "TASK_FINISHED", scalar(usd, 4)),
 			snapshotTask("task-old", "TASK_FINISHED", scalar(tau, 50)),
 		},
 	)
@@ -1170,13 +1177,15 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 	// The snapshot debits task-d only: task-c is not debited again and the
 	// ended task-old, which the ledger never held, is not debited at all.
 	// A TASK_ADDED on the new stream is debited.
-	// The total changes once, when task-a's reservation of 20 is closed
-	// and stops being counted as running.
+	// The totals change twice: task-a's reservation of 20 is closed in the
+	// synced pool, and task-u's 4 is marked ended in the unsynced pool.
+	// Both stop being counted as running.
 	h.events <- taskAdded("task-e", scalar(tau, 1))
 	waitReserved(t, l, tau, "task-e")
 	wantStates(t, h,
 		map[string]float64{tau: 38, usd: 50},
 		map[string]float64{tau: 18, usd: 50},
+		map[string]float64{tau: 18, usd: 46},
 	)
 	if bal := tauBalance(t, l); bal != 7 {
 		t.Fatalf("balance = %v, want 7", bal)
@@ -1197,9 +1206,13 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 	if _, ok := snap.Pools[tau].Tasks["task-old"]; ok {
 		t.Fatal("an ended task the ledger never held was debited from the snapshot")
 	}
-	// The unsynced pool still waits for /settle.
-	if e := snap.Pools[usd].Tasks["task-b"]; e.Settled || e.Reserved != 2 {
-		t.Fatalf("unsynced entry of task-b = %+v, want unsettled reservation of 2", e)
+	// The unsynced pool still waits for /settle. Its ended task is marked,
+	// and the one the snapshot does not list is not.
+	if e := snap.Pools[usd].Tasks["task-b"]; e.Settled || e.Ended || e.Reserved != 2 {
+		t.Fatalf("unsynced entry of task-b = %+v, want a running, unsettled reservation of 2", e)
+	}
+	if e := snap.Pools[usd].Tasks["task-u"]; e.Settled || !e.Ended || e.Reserved != 4 {
+		t.Fatalf("unsynced entry of task-u = %+v, want an ended, unsettled reservation of 4", e)
 	}
 
 	// The next read reports 30. The balance has the four open reservations
@@ -1207,7 +1220,7 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 	// those four allocations from.
 	q.set(func(q *quotaServer) { q.used = 70 })
 	h.p.syncPool(context.Background(), tau, q.poller(t))
-	if got := h.waitStates(3)[2]; !reflect.DeepEqual(got, map[string]float64{tau: 30, usd: 50}) {
+	if got := h.waitStates(4)[3]; !reflect.DeepEqual(got, map[string]float64{tau: 30, usd: 46}) {
 		t.Fatalf("UPDATE_STATE after the next read = %v, want %s=30", got, tau)
 	}
 	if bal := tauBalance(t, l); bal != 19 {
