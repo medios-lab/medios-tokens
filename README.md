@@ -166,7 +166,8 @@ Debits and task endings come from the controller's event stream (`POST /api/v1` 
 The controller starts every subscription with a snapshot of its tasks, and the provider uses it to cover events sent while no stream was open, including the time the provider itself was stopped:
 
 - A task the snapshot lists as launched and not ended is debited. The debit is once per task ID, so a task debited earlier is unchanged.
-- A debited, unsettled reservation whose task the snapshot lists as ended, or does not list, is handled like a terminal task event: closed in a synced pool, settled through the provisioner where one is configured, and left open for `/settle` in any other pool.
+- A debited, unsettled reservation whose task the snapshot lists as ended is handled like a terminal task event: closed in a synced pool, settled through the provisioner where one is configured, and left open for `/settle` in any other pool.
+- A reservation whose task the snapshot does not list stays open, and its task ID is logged. A controller that has just taken over lists a node's tasks only after the node registers with it again, so a missing task may still be running. If it has ended, `/settle` closes the reservation.
 
 A task that was both launched and ended while no stream was open is not debited. The provider does not time out a stream that stays open and delivers nothing.
 

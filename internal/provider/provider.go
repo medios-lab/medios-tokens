@@ -734,19 +734,21 @@ func (p *Provider) taskEnded(ctx context.Context, taskID, state string) {
 	p.releaseSynced(taskID, state)
 }
 
-// taskAbsent is the state logged for a reservation whose task the
-// controller's snapshot does not list.
-const taskAbsent = "absent from the controller snapshot"
-
 // applyTaskSnapshot brings the ledger up to date with the task snapshot the
 // controller sends at the start of a subscription, covering task events sent
 // while no stream was open.
 //
 // A task the snapshot lists as launched and not ended is debited; the debit
 // is once per task ID, so a task debited earlier is unchanged. A task with a
-// debited, unsettled reservation that the snapshot lists as ended, or does
-// not list, is handled as taskEnded handles a terminal update. A ledger entry
-// with no debit (a key recorded for a task not launched yet) is left alone.
+// debited, unsettled reservation that the snapshot lists as ended is handled
+// as taskEnded handles a terminal update.
+//
+// A reservation whose task the snapshot does not list stays open and is
+// logged. Absence does not show the task ended: a controller that has just
+// taken over lists a node's tasks only after that node registers with it
+// again, and the stream that ended is often the one to the controller it
+// replaced. Closing such reservations would stop subtracting running tasks
+// from a synced pool and would revoke running tasks' provisioned keys.
 //
 // A task that was both launched and ended while no stream was open is not
 // debited: the snapshot's ended tasks include ones from before the ledger
@@ -787,19 +789,24 @@ func (p *Provider) applyTaskSnapshot(ctx context.Context, tasks *ctrlTasks) {
 			}
 		}
 	}
-	ids := make([]string, 0, len(open))
+	var closed, absent []string
 	for id := range open {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		state, ok := ended[id]
-		if !ok {
-			state = taskAbsent
+		if _, ok := ended[id]; ok {
+			closed = append(closed, id)
+		} else {
+			absent = append(absent, id)
 		}
-		p.taskEnded(ctx, id, state)
 	}
-	p.logger.Printf("applied controller task snapshot: %d tasks not ended, %d reservations of ended tasks handled", len(live), len(ids))
+	sort.Strings(closed)
+	sort.Strings(absent)
+	for _, id := range closed {
+		p.taskEnded(ctx, id, ended[id])
+	}
+	p.logger.Printf("applied controller task snapshot: %d tasks not ended, %d ended tasks with open reservations handled", len(live), len(closed))
+	if len(absent) > 0 {
+		p.logger.Printf("controller task snapshot does not list %d tasks with open reservations, left open: %s",
+			len(absent), strings.Join(absent, ", "))
+	}
 }
 
 // settleProvisioned settles an ended task in the provisioner's pool with the

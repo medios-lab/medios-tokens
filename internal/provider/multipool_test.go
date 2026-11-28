@@ -980,8 +980,8 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 		map[string]float64{tau: 10, usd: 48},
 	)
 
-	// While it is down: task-a finishes, task-b disappears from the
-	// controller, task-c keeps running and task-d is launched.
+	// While it is down: task-a finishes, task-c keeps running and task-d is
+	// launched. The new snapshot does not list task-b at all.
 	h.mu.Lock()
 	h.snapshot = subscribed(
 		[]map[string]any{
@@ -1010,15 +1010,14 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 		map[string]float64{tau: 7, usd: 48},
 	)
 
-	// The reservations of the ended and the absent task are settled as
-	// spent in the synced pool; the balance was not raised for them.
-	for _, id := range []string{"task-a", "task-b"} {
-		if e := waitClosed(t, l, id); !e.Released || e.Actual != e.Reserved {
-			t.Fatalf("%s entry = %+v, want released with actual = reserved", id, e)
-		}
+	// The reservation of the ended task is settled as spent in the synced
+	// pool; the balance was not raised for it. The task the snapshot does
+	// not list keeps its reservation, since absence does not show it ended.
+	if e := waitClosed(t, l, "task-a"); !e.Released || e.Actual != e.Reserved {
+		t.Fatalf("task-a entry = %+v, want released with actual = reserved", e)
 	}
 	snap := l.Snapshot()
-	for _, id := range []string{"task-c", "task-d", "task-e"} {
+	for _, id := range []string{"task-b", "task-c", "task-d", "task-e"} {
 		if e := snap.Pools[tau].Tasks[id]; e.Settled || e.Reserved == 0 {
 			t.Fatalf("%s entry = %+v, want an open reservation", id, e)
 		}
@@ -1031,15 +1030,19 @@ func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
 		t.Fatalf("unsynced entry of task-b = %+v, want unsettled reservation of 2", e)
 	}
 
-	// The next read subtracts only the three open reservations: 30 - 6.
+	// The next read subtracts the four open reservations: 30 - 11.
 	q.set(func(q *quotaServer) { q.used = 70 })
 	h.p.syncPool(context.Background(), tau, q.poller(t))
-	if got := h.waitStates(7)[6]; !reflect.DeepEqual(got, map[string]float64{tau: 24, usd: 48}) {
-		t.Fatalf("UPDATE_STATE after the next read = %v, want %s=24", got, tau)
+	if got := h.waitStates(7)[6]; !reflect.DeepEqual(got, map[string]float64{tau: 19, usd: 48}) {
+		t.Fatalf("UPDATE_STATE after the next read = %v, want %s=19", got, tau)
 	}
 
 	out := logs.String()
-	for _, want := range []string{"controller event stream disconnected", "controller event stream connected"} {
+	for _, want := range []string{
+		"controller event stream disconnected",
+		"controller event stream connected",
+		"does not list 1 tasks with open reservations, left open: task-b",
+	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("log lacks %q:\n%s", want, out)
 		}
