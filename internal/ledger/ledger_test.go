@@ -606,47 +606,50 @@ func TestSettleAfterShortfallDebitAndRefill(t *testing.T) {
 	}
 }
 
-func TestReleaseTaskReturnsReservationOnce(t *testing.T) {
+func TestReleaseTaskClosesReservationWithoutRaisingBalance(t *testing.T) {
 	l, err := OpenPools("", []PoolSpec{{Resource: "q", Initial: 100, Cap: 100}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	reserve(t, l, "q", "a", 40)
-	reserve(t, l, "q", "b", 20)
-	// External: 10 remaining against 60 reserved, so the deficit is 50.
-	if _, err := l.Reconcile("q", l.SettleEpoch("q"), External{Available: 10}); err != nil {
+	// External: 38 remaining; the task then reserves 20.
+	if _, err := l.Reconcile("q", l.SettleEpoch("q"), External{Available: 38}); err != nil {
 		t.Fatal(err)
 	}
+	reserve(t, l, "q", "a", 20)
 	epoch := l.SettleEpoch("q")
 
 	// A task the pool has no entry for is not an error and changes nothing.
-	if _, _, released, err := l.ReleaseTask("q", "nope"); err != nil || released {
+	if _, released, err := l.ReleaseTask("q", "nope"); err != nil || released {
 		t.Fatalf("ReleaseTask(unknown) = released %v, err %v; want false, nil", released, err)
 	}
 	if l.SettleEpoch("q") != epoch {
 		t.Fatal("a release of an unknown task advanced the settle epoch")
 	}
 
-	// Releasing 40 pays the deficit down to 10; releasing 20 more leaves 10.
-	if delta, bal, released, err := l.ReleaseTask("q", "a"); err != nil || !released || delta != 40 || bal != 0 {
-		t.Fatalf("ReleaseTask(a) = (%v, %v, %v, %v), want (40, 0, true, nil)", delta, bal, released, err)
+	if bal, released, err := l.ReleaseTask("q", "a"); err != nil || !released || bal != 18 {
+		t.Fatalf("ReleaseTask(a) = (%v, %v, %v), want (18, true, nil)", bal, released, err)
 	}
-	if delta, bal, released, err := l.ReleaseTask("q", "b"); err != nil || !released || delta != 20 || bal != 10 {
-		t.Fatalf("ReleaseTask(b) = (%v, %v, %v, %v), want (20, 10, true, nil)", delta, bal, released, err)
+	if e := l.Snapshot().Pools["q"].Tasks["a"]; !e.Settled || !e.Released || e.Actual != 20 {
+		t.Fatalf("entry = %+v, want settled, released, actual 20", e)
 	}
-	if e := l.Snapshot().Pools["q"].Tasks["a"]; !e.Settled || !e.Released || e.Actual != 0 {
-		t.Fatalf("entry = %+v, want settled and released", e)
-	}
-	// A reading taken before the releases is rejected.
-	if _, err := l.Reconcile("q", epoch, External{Available: 10}); !errors.Is(err, ErrStaleReading) {
+
+	// A reading taken before the release is rejected; a new one is applied
+	// without subtracting the closed reservation.
+	if _, err := l.Reconcile("q", epoch, External{Available: 30}); !errors.Is(err, ErrStaleReading) {
 		t.Fatalf("Reconcile with an old epoch = %v, want ErrStaleReading", err)
+	}
+	if _, err := l.Reconcile("q", l.SettleEpoch("q"), External{Available: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if bal := mustBalance(t, l, "q"); bal != 30 {
+		t.Fatalf("balance after the next reading = %v, want 30", bal)
 	}
 
 	// A second release and a later settlement both leave the balance alone.
-	if _, bal, released, err := l.ReleaseTask("q", "a"); err != nil || released || bal != 10 {
-		t.Fatalf("second ReleaseTask(a) = (balance %v, released %v, %v), want (10, false, nil)", bal, released, err)
+	if bal, released, err := l.ReleaseTask("q", "a"); err != nil || released || bal != 30 {
+		t.Fatalf("second ReleaseTask(a) = (%v, %v, %v), want (30, false, nil)", bal, released, err)
 	}
-	if delta, bal, err := l.SettleTask("q", "a", 7); err != nil || delta != 0 || bal != 10 {
-		t.Fatalf("SettleTask after release = (%v, %v, %v), want (0, 10, nil)", delta, bal, err)
+	if delta, bal, err := l.SettleTask("q", "a", 7); err != nil || delta != 0 || bal != 30 {
+		t.Fatalf("SettleTask after release = (%v, %v, %v), want (0, 30, nil)", delta, bal, err)
 	}
 }

@@ -634,7 +634,7 @@ func (p *Provider) watchController(ctx context.Context) error {
 			if p.cfg.Provisioner != nil {
 				p.settleProvisioned(ctx, taskID, state)
 			}
-			p.releaseSynced(ctx, taskID, state)
+			p.releaseSynced(taskID, state)
 		}
 	}
 }
@@ -660,14 +660,15 @@ func (p *Provider) settleProvisioned(ctx context.Context, taskID, state string) 
 	p.logger.Printf("auto-settled provisioned task %s in %s on %s actual=%.6g delta=%+.6g balance=%.6g", taskID, resource, state, actual, delta, bal)
 }
 
-// releaseSynced closes an ended task's open reservation in every synced pool
-// and advertises once if any balance changed. The pool's external reading
-// already counts what the task spent, or will at the next read, so the
-// reservation is returned whole and no spend figure is needed. Unsynced pools
-// are left alone: their reservations stay open until /settle reports the
-// spend. The provisioner's pool is settled by settleProvisioned.
-func (p *Provider) releaseSynced(ctx context.Context, taskID, state string) {
-	var released []string
+// releaseSynced closes an ended task's open reservation in every synced pool.
+// The balance is left where it is: the external reading is the record of what
+// the task spent, and the next read sets the balance from it without
+// subtracting this reservation. Returning the reservation at once would
+// advertise capacity the task may have used. Nothing is advertised, because
+// no balance changes. Unsynced pools are left alone: their reservations stay
+// open until /settle reports the spend. The provisioner's pool is settled by
+// settleProvisioned.
+func (p *Provider) releaseSynced(taskID, state string) {
 	for _, name := range p.resources {
 		if p.cfg.Pools[name].Source == nil {
 			continue
@@ -675,25 +676,14 @@ func (p *Provider) releaseSynced(ctx context.Context, taskID, state string) {
 		if p.cfg.Provisioner != nil && name == p.cfg.ProvisionerResource {
 			continue
 		}
-		delta, bal, ok, err := p.ledger.ReleaseTask(name, taskID)
+		bal, ok, err := p.ledger.ReleaseTask(name, taskID)
 		if err != nil {
 			p.logger.Printf("release of task %s in %s failed: %v", taskID, name, err)
 			continue
 		}
-		if !ok {
-			continue
+		if ok {
+			p.logger.Printf("closed reservation of task %s in %s on %s; balance stays %.6g until the next read", taskID, name, state, bal)
 		}
-		p.logger.Printf("released reservation of task %s in %s on %s amount=%.6g balance=%.6g", taskID, name, state, delta, bal)
-		if delta != 0 {
-			released = append(released, name)
-		}
-	}
-	if len(released) == 0 {
-		return
-	}
-	reason := fmt.Sprintf("released task %s in %s", taskID, strings.Join(released, ","))
-	if err := p.Advertise(ctx, reason); err != nil && ctx.Err() == nil {
-		p.logger.Printf("advertise error after release of task %s: %v", taskID, err)
 	}
 }
 

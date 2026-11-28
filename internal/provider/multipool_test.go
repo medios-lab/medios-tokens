@@ -751,62 +751,90 @@ func wantStates(t *testing.T, h *harness, want ...map[string]float64) {
 	}
 }
 
-func TestSyncedPoolReleasesReservationWhenTaskEnds(t *testing.T) {
+// waitClosed blocks until the task's entry in the synced pool is settled.
+func waitClosed(t *testing.T, l *ledger.Ledger, taskID string) ledger.TaskEntry {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if e := l.Snapshot().Pools[tau].Tasks[taskID]; e.Settled {
+			return e
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("reservation of %s in %s was not closed", taskID, tau)
+	return ledger.TaskEntry{}
+}
+
+func TestSyncedPoolClosesReservationWhenTaskEnds(t *testing.T) {
 	for _, state := range []string{"TASK_FINISHED", "TASK_KILLED", "TASK_LOST"} {
 		t.Run(state, func(t *testing.T) {
 			h, l, q := syncedHarness(t, "")
 			h.events <- taskAdded("task-1", scalar(tau, 20), scalar(usd, 2))
-			// A non-terminal update changes nothing: the next UPDATE_STATE
-			// after the debit is the one the terminal update causes.
-			h.events <- taskUpdated("task-1", "TASK_RUNNING")
-			h.events <- taskUpdated("task-1", state)
 			wantStates(t, h,
 				map[string]float64{tau: 38, usd: 50},
 				map[string]float64{tau: 18, usd: 48},
-				map[string]float64{tau: 38, usd: 48},
 			)
-			if n, _ := q.seen(); n != 1 {
-				t.Fatalf("endpoint was read %d times, want 1: the release must not depend on a read", n)
+
+			// A non-terminal update leaves the reservation open. The debit
+			// behind it on the stream proves it was processed.
+			h.events <- taskUpdated("task-1", "TASK_RUNNING")
+			h.events <- taskAdded("task-2", scalar(usd, 1))
+			wantStates(t, h,
+				map[string]float64{tau: 38, usd: 50},
+				map[string]float64{tau: 18, usd: 48},
+				map[string]float64{tau: 18, usd: 47},
+			)
+			if e := l.Snapshot().Pools[tau].Tasks["task-1"]; e.Settled {
+				t.Fatalf("TASK_RUNNING closed the reservation: %+v", e)
 			}
 
-			snap := l.Snapshot()
-			if e := snap.Pools[tau].Tasks["task-1"]; !e.Settled || !e.Released || e.Actual != 0 {
-				t.Fatalf("synced pool entry = %+v, want settled and released", e)
+			// The terminal update closes the reservation and leaves the
+			// balance at 18.
+			h.events <- taskUpdated("task-1", state)
+			if e := waitClosed(t, l, "task-1"); !e.Released || e.Actual != 20 {
+				t.Fatalf("synced pool entry = %+v, want released with actual 20", e)
+			}
+			if bal, _ := l.Balance(tau); bal != 18 {
+				t.Fatalf("balance after %s = %v, want 18", state, bal)
 			}
 			// The unsynced pool's reservation stays open until /settle.
-			if e := snap.Pools[usd].Tasks["task-1"]; e.Settled || e.Reserved != 2 {
+			if e := l.Snapshot().Pools[usd].Tasks["task-1"]; e.Settled || e.Reserved != 2 {
 				t.Fatalf("unsynced pool entry = %+v, want unsettled reservation of 2", e)
 			}
-
-			// A repeated terminal update releases nothing more.
-			h.events <- taskUpdated("task-1", state)
-			h.events <- taskAdded("task-2", scalar(tau, 1))
-			if got := h.waitStates(4); len(got) != 4 || !reflect.DeepEqual(got[3], map[string]float64{tau: 37, usd: 48}) {
-				t.Fatalf("UPDATE_STATE sequence after repeat = %v, want a fourth state with %s=37", got, tau)
+			if n, _ := q.seen(); n != 1 {
+				t.Fatalf("endpoint was read %d times, want 1", n)
 			}
+
+			// The next read reports 30 remaining and that is advertised
+			// whole: the closed reservation is not subtracted from it.
+			q.set(func(q *quotaServer) { q.used = 70 })
+			h.p.syncPool(context.Background(), tau, q.poller(t))
+			wantStates(t, h,
+				map[string]float64{tau: 38, usd: 50},
+				map[string]float64{tau: 18, usd: 48},
+				map[string]float64{tau: 18, usd: 47},
+				map[string]float64{tau: 30, usd: 47},
+			)
 		})
 	}
 }
 
-func TestSettleAfterAutomaticReleaseChangesNothing(t *testing.T) {
+func TestSettleAfterAutomaticCloseChangesNothing(t *testing.T) {
 	h, l, _ := syncedHarness(t, "")
 	h.events <- taskAdded("task-1", scalar(tau, 20))
 	h.events <- taskUpdated("task-1", "TASK_FINISHED")
+	waitClosed(t, l, "task-1")
+
+	code, body := h.post("/settle", fmt.Sprintf(`{"task_id":"task-1","actual":5,"resource":%q}`, tau))
+	if code != http.StatusOK || body["delta"] != 0.0 || body["balance"] != 18.0 {
+		t.Fatalf("/settle after the terminal update = HTTP %d %v, want 200 delta 0 balance 18", code, body)
+	}
 	wantStates(t, h,
 		map[string]float64{tau: 38, usd: 50},
 		map[string]float64{tau: 18, usd: 50},
-		map[string]float64{tau: 38, usd: 50},
 	)
-
-	code, body := h.post("/settle", fmt.Sprintf(`{"task_id":"task-1","actual":5,"resource":%q}`, tau))
-	if code != http.StatusOK || body["delta"] != 0.0 || body["balance"] != 38.0 {
-		t.Fatalf("/settle after release = HTTP %d %v, want 200 delta 0 balance 38", code, body)
-	}
-	if got := h.states(); len(got) != 3 {
-		t.Fatalf("/settle after release sent an UPDATE_STATE: %v", got)
-	}
-	if bal, _ := l.Balance(tau); bal != 38 {
-		t.Fatalf("balance = %v, want 38", bal)
+	if e := l.Snapshot().Pools[tau].Tasks["task-1"]; !e.Released || e.Actual != 20 {
+		t.Fatalf("entry = %+v, want the automatic close kept", e)
 	}
 }
 
@@ -824,7 +852,7 @@ func TestTerminalUpdateAfterSettleChangesNothing(t *testing.T) {
 	}
 
 	// The terminal update finds the task settled. The debit that follows it
-	// on the stream produces the next UPDATE_STATE, from 33 and not from 38.
+	// on the stream produces the next UPDATE_STATE, from 33.
 	h.events <- taskUpdated("task-1", "TASK_FINISHED")
 	h.events <- taskAdded("task-2", scalar(tau, 1))
 	wantStates(t, h,
@@ -838,7 +866,7 @@ func TestTerminalUpdateAfterSettleChangesNothing(t *testing.T) {
 	}
 }
 
-func TestReservationIsReleasedAfterRestart(t *testing.T) {
+func TestReservationIsClosedAfterRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 
 	t.Run("reserve", func(t *testing.T) {
@@ -851,15 +879,20 @@ func TestReservationIsReleasedAfterRestart(t *testing.T) {
 	})
 
 	// A new process loads the checkpoint. Its first read subtracts the
-	// reservation the checkpoint kept, and the terminal update releases it.
-	h, l, _ := syncedHarness(t, path)
+	// reservation the checkpoint kept, and the terminal update closes it.
+	h, l, q := syncedHarness(t, path)
 	if e := l.Snapshot().Pools[tau].Tasks["task-1"]; e.Settled || e.Reserved != 20 {
 		t.Fatalf("entry after restart = %+v, want unsettled reservation of 20", e)
 	}
 	wantStates(t, h, map[string]float64{tau: 18, usd: 50})
 	h.events <- taskUpdated("task-1", "TASK_FINISHED")
+	waitClosed(t, l, "task-1")
+
+	// The next read is applied without the closed reservation.
+	q.set(func(q *quotaServer) { q.used = 70 })
+	h.p.syncPool(context.Background(), tau, q.poller(t))
 	wantStates(t, h,
 		map[string]float64{tau: 18, usd: 50},
-		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 30, usd: 50},
 	)
 }
