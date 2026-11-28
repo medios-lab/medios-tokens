@@ -301,15 +301,6 @@ func (p *Provider) formatBalances(balances map[string]float64) string {
 	return strings.Join(parts, " ")
 }
 
-// countsRunning reports whether a pool is advertised with the reservations of
-// running tasks added back to its balance (see ledger.Totals). It is true for
-// synced pools: their reservations are closed when the task ends, so an
-// unsettled reservation there belongs to a task that still holds its
-// allocation.
-func (p *Provider) countsRunning(resource string) bool {
-	return p.cfg.Pools[resource].Source != nil
-}
-
 // resetAdvertised forgets what the node last accepted, so the next Advertise
 // sends an UPDATE_STATE whatever the totals are. Run calls it on each
 // SUBSCRIBED, because a new subscription starts without the earlier state.
@@ -321,8 +312,8 @@ func (p *Provider) resetAdvertised() {
 
 // Advertise pushes every pool's total to medios-node in one UPDATE_STATE: one
 // scalar resource per pool with a positive total. The total is what the
-// broker's allocator subtracts allocations from, so for a synced pool it
-// includes the reservations of running tasks. Nothing is sent when the totals
+// broker's allocator subtracts allocations from, so it includes the
+// reservations of running tasks (see ledger.Totals). Nothing is sent when the totals
 // equal the ones the node last accepted.
 func (p *Provider) Advertise(ctx context.Context, reason string) error {
 	p.advMu.Lock()
@@ -336,7 +327,7 @@ func (p *Provider) Advertise(ctx context.Context, reason string) error {
 		return nil
 	}
 
-	balances := p.ledger.Totals(p.countsRunning)
+	balances := p.ledger.Totals()
 	if !p.advPending && p.advLast != nil && equalTotals(p.advLast, balances) {
 		return nil
 	}
@@ -774,8 +765,13 @@ func (p *Provider) taskEnded(ctx context.Context, taskID, state string) {
 		p.settleProvisioned(ctx, taskID, state)
 	}
 	p.releaseSynced(taskID, state)
-	// The ended task no longer holds an allocation, so a reservation closed
-	// above leaves the pool's total.
+	// A reservation still unsettled here waits for /settle: an unsynced
+	// pool's, or the provisioner pool's after a failed settlement. The task
+	// no longer holds an allocation, so the reservation is marked ended and
+	// leaves the pool's total, as the ones closed above do.
+	if _, err := p.ledger.MarkEnded(taskID); err != nil {
+		p.logger.Printf("marking task %s ended failed: %v", taskID, err)
+	}
 	if err := p.Advertise(ctx, fmt.Sprintf("task %s ended (%s)", taskID, state)); err != nil && ctx.Err() == nil {
 		p.logger.Printf("advertise error after task %s ended: %v", taskID, err)
 	}
@@ -828,11 +824,17 @@ func (p *Provider) applyTaskSnapshot(ctx context.Context, tasks *ctrlTasks) {
 		}
 	}
 
+	// endedOpen holds tasks already marked ended that wait for /settle. They
+	// are not reported as absent from the snapshot.
 	open := make(map[string]bool)
+	endedOpen := make(map[string]bool)
 	for _, pool := range p.ledger.Snapshot().Pools {
 		for id, entry := range pool.Tasks {
 			if !entry.Settled && entry.Reserved > 0 && !live[id] {
 				open[id] = true
+				if entry.Ended {
+					endedOpen[id] = true
+				}
 			}
 		}
 	}
@@ -840,7 +842,7 @@ func (p *Provider) applyTaskSnapshot(ctx context.Context, tasks *ctrlTasks) {
 	for id := range open {
 		if _, ok := ended[id]; ok {
 			closed = append(closed, id)
-		} else {
+		} else if !endedOpen[id] {
 			absent = append(absent, id)
 		}
 	}

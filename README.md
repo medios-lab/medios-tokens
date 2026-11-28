@@ -13,6 +13,7 @@ Reference HTTP Resource Provider for consumable API token budgets on [Medios](ht
 1. Reads one or more externally governed budgets (`--initial` and `--cap`, a `--config` file of named pools, an HTTP balance endpoint per pool, or a durable `--state-file` checkpoint).
 2. Advertises available capacity to a `medios-node` over `POST /api/v1/resource_provider` (`UPDATE_STATE`).
 3. Authorizes task launch reservations (`Event::PUBLISH_RESOURCES` -> `UPDATE_PUBLISH_RESOURCES_STATUS`).
+   The advertised total of a pool is its balance plus the reservations of tasks still running, because the broker's allocator subtracts what running tasks hold from the total it is given.
 4. Debits each accepted task once per `task_id` via controller `/api/v1` `TASK_ADDED` events, and optionally reconciles actual consumption (`POST /settle`) to release unused capacity back into the pool. A pool synced from an HTTP endpoint needs no `/settle`: its reservations are closed when the task ends.
 5. Updates Medios whenever the balance changes (`SIGUSR1`, `--refill-interval`, or `POST /refill`).
 
@@ -143,23 +144,23 @@ After each read the pool's cap becomes the external cap and its balance becomes
 max(0, external available - reservations of tasks not yet settled)
 ```
 
-The balance is what `/balance` reports and what a new reservation is checked against. It is not the value sent to the node. The broker's allocator offers a resource's advertised total less what tasks already hold, so it subtracts a running task's reservation itself, and a total that had the reservation subtracted as well would count it twice. The provider therefore advertises a synced pool as
+The balance is what `/balance` reports and what a new reservation is checked against. It is not the value sent to the node. The broker's allocator offers a resource's advertised total less what tasks already hold, so it subtracts a running task's reservation itself, and a total that had the reservation subtracted as well would count it twice. The provider therefore advertises every pool as
 
 ```
-balance + max(0, reservations of tasks not yet settled - deficit)
+balance + max(0, reservations of running tasks - deficit)
 ```
 
-which is the external figure while those tasks run. With 33 remaining and one running task that reserved 5, the balance is 28, the advertised total is 33, and the allocator offers 28. A new reservation changes the balance and leaves the total alone, so it sends no `UPDATE_STATE`.
+where a running task is one that is neither settled nor known to have ended. For a synced pool this is the external figure while those tasks run. With 33 remaining and one running task that reserved 5, the balance is 28, the advertised total is 33, and the allocator offers 28. A new reservation changes the balance and leaves the total alone, so it sends no `UPDATE_STATE`.
 
 While a task runs, its full reservation is held back even if the endpoint already counts part of its spend, so the amount on offer is lower than the true one.
 
 A synced pool closes a task's reservation when the task ends. On a terminal `TASK_UPDATED` event from the controller (finished, failed, killed, lost, gone, error or dropped), the provider marks the task's reservation in every synced pool as settled and leaves the balance where it is. The advertised total drops by the reservation, to the balance, because the allocator has stopped subtracting the ended task. The next read then sets the balance from the endpoint's figure without subtracting that reservation. Frameworks do not call `/settle` for a synced pool, because the endpoint's own count is the record of what the task spent. Between the end of the task and the next read, the balance and the total are lower than the true figure by whatever part of the reservation the task did not spend. The reservation is not returned at once because the endpoint may already count the task's spend, and the returned amount would then be advertised twice. The controller frees the task's allocation before the provider's lower total reaches the node, so for that interval the allocator can offer up to the reservation more than the balance.
 
-A `/settle` for the same task before or after the terminal event is accepted and is applied once: whichever arrives second changes nothing. An entry closed by a terminal event shows `"released": true` under `tasks` in `/balance`, with `actual` equal to the reservation because the ledger was not told the spend. Pools without `sync` are unchanged and keep a reservation open until `/settle` reports the spend.
+A `/settle` for the same task before or after the terminal event is accepted and is applied once: whichever arrives second changes nothing. An entry closed by a terminal event shows `"released": true` under `tasks` in `/balance`, with `actual` equal to the reservation because the ledger was not told the spend. A pool without `sync` keeps a reservation open until `/settle` reports the spend. The terminal event marks that reservation `"ended": true` in `/balance`: it stays subtracted from the balance, and it leaves the advertised total because the allocator no longer subtracts the task. With a balance of 100 and one task reserving 25, the total is 100 while the task runs, 75 once it ends, and 82 after a `/settle` with `actual` 18. A `/settle` while the task still runs takes the reservation out of the total at once, so until the task ends the allocator offers less than the balance by the reservation.
 
 A task ending the provider did not receive an event for is picked up from the controller's task snapshot at the next subscription (see [Controller event stream](#controller-event-stream)).
 
-The amount on offer can be higher than the true one in three cases. If the endpoint reports a task's spend some time after the task ends, reads in between see the reservation gone and the spend not yet counted. Spend against the same external quota that did not pass through a task reservation is visible only after the next read. A reservation whose task ended without the provider learning of it is still added to the total while the allocator subtracts nothing for it, until a terminal event, a controller snapshot that lists the task as ended, or a `/settle` closes it.
+The amount on offer can be higher than the true one in three cases. If the endpoint reports a task's spend some time after the task ends, reads in between see the reservation gone and the spend not yet counted. Spend against the same external quota that did not pass through a task reservation is visible only after the next read. A reservation whose task ended without the provider learning of it is still added to the total while the allocator subtracts nothing for it, until a terminal event, a controller snapshot that lists the task as ended, or a `/settle` closes it. This case applies to pools without `sync` too.
 
 When a read reports less than the unsettled reservations, the balance is zero and the ledger records the uncovered amount as the pool's `deficit` in the checkpoint. The advertised total is then the external figure: 3 remaining with 5 reserved is advertised as 3. A task that then settles below its reservation pays the deficit down first, so the balance rises only by what the external reading covers. If the node rejects an `UPDATE_STATE`, the next read of any synced pool sends the current totals again, whether or not that read changed anything.
 
@@ -174,7 +175,7 @@ Debits and task endings come from the controller's event stream (`POST /api/v1` 
 The controller starts every subscription with a snapshot of its tasks, and the provider uses it to cover events sent while no stream was open, including the time the provider itself was stopped:
 
 - A task the snapshot lists as launched and not ended is debited. The debit is once per task ID, so a task debited earlier is unchanged.
-- A debited, unsettled reservation whose task the snapshot lists as ended is handled like a terminal task event: closed in a synced pool, settled through the provisioner where one is configured, and left open for `/settle` in any other pool.
+- A debited, unsettled reservation whose task the snapshot lists as ended is handled like a terminal task event: closed in a synced pool, settled through the provisioner where one is configured, and marked ended and left open for `/settle` in any other pool.
 - A reservation whose task the snapshot does not list stays open, and its task ID is logged. A controller that has just taken over lists a node's tasks only after the node registers with it again, so a missing task may still be running. If it has ended, `/settle` closes the reservation.
 
 A task that was both launched and ended while no stream was open is not debited. The provider does not time out a stream that stays open and delivers nothing.

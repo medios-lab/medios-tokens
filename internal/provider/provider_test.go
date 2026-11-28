@@ -128,14 +128,19 @@ func TestProviderReserveAuthorizeSettleRefill(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
-		ok := publishAcks == 2 && len(advertised) >= 2
+		ok := publishAcks == 2
 		mu.Unlock()
+		if bal, _ := l.Balance("token_budget"); bal != 75 {
+			ok = false
+		}
 		if ok {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	// The debit to 75 sends no UPDATE_STATE: the allocator subtracts the
+	// running task's 25 from the advertised 100.
 	// Settle task-1 with actual=18 -> releases 7 unused back to 82.
 	adminSrv := httptest.NewServer(p.AdminHandler())
 	defer adminSrv.Close()
@@ -160,7 +165,7 @@ func TestProviderReserveAuthorizeSettleRefill(t *testing.T) {
 	if publishAcks != 2 {
 		t.Fatalf("publishAcks = %d, want 2", publishAcks)
 	}
-	want := []float64{100, 75, 82, 92}
+	want := []float64{100, 82, 92}
 	if len(advertised) != len(want) {
 		t.Fatalf("advertised = %v, want %v", advertised, want)
 	}
@@ -318,14 +323,12 @@ func TestProviderScopedKeyProvisionAndTerminalSettle(t *testing.T) {
 		t.Fatalf("checkpoint leaked raw secret key!")
 	}
 
-	// 2. Task launches -> debit 25 (100 -> 75).
+	// 2. Task launches -> debit 25 (balance 100 -> 75). The advertised total
+	// stays 100 while the task runs.
 	close(emitTask)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		mu.Lock()
-		n := len(advertised)
-		mu.Unlock()
-		if n >= 2 {
+		if bal, _ := l.Balance("token_budget"); bal == 75 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -338,7 +341,7 @@ func TestProviderScopedKeyProvisionAndTerminalSettle(t *testing.T) {
 		mu.Lock()
 		n := len(advertised)
 		mu.Unlock()
-		if n >= 3 {
+		if n >= 2 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -349,7 +352,7 @@ func TestProviderScopedKeyProvisionAndTerminalSettle(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	want := []float64{100, 75, 93.5}
+	want := []float64{100, 93.5}
 	if len(advertised) != len(want) {
 		t.Fatalf("advertised = %v, want %v", advertised, want)
 	}
