@@ -620,7 +620,7 @@ func (p *Provider) watchController(ctx context.Context) error {
 			p.debitTask(ctx, taskID, reqs)
 
 		case "TASK_UPDATED":
-			if ev.TaskUpdated == nil || ev.TaskUpdated.Status == nil || p.cfg.Provisioner == nil {
+			if ev.TaskUpdated == nil || ev.TaskUpdated.Status == nil {
 				continue
 			}
 			taskID := ev.TaskUpdated.Status.TaskID.Value
@@ -631,23 +631,69 @@ func (p *Provider) watchController(ctx context.Context) error {
 			if taskID == "" || !isTerminalTaskState(state) {
 				continue
 			}
-			resource := p.cfg.ProvisionerResource
-			keyHash, settled, ok := p.ledger.TaskKeyHash(resource, taskID)
-			if !ok || settled {
-				continue
+			if p.cfg.Provisioner != nil {
+				p.settleProvisioned(ctx, taskID, state)
 			}
-			actual, err := p.cfg.Provisioner.SettleAndRevoke(ctx, taskID, keyHash)
-			if err != nil {
-				p.logger.Printf("provisioner settle/revoke failed for task %s (%s): %v", taskID, state, err)
-				continue
-			}
-			delta, bal, err := p.Settle(ctx, resource, taskID, actual)
-			if err != nil {
-				p.logger.Printf("ledger settle failed for task %s: %v", taskID, err)
-				continue
-			}
-			p.logger.Printf("auto-settled provisioned task %s in %s on %s actual=%.6g delta=%+.6g balance=%.6g", taskID, resource, state, actual, delta, bal)
+			p.releaseSynced(ctx, taskID, state)
 		}
+	}
+}
+
+// settleProvisioned settles an ended task in the provisioner's pool with the
+// spend the provisioner reports for the task's key, and revokes the key.
+func (p *Provider) settleProvisioned(ctx context.Context, taskID, state string) {
+	resource := p.cfg.ProvisionerResource
+	keyHash, settled, ok := p.ledger.TaskKeyHash(resource, taskID)
+	if !ok || settled {
+		return
+	}
+	actual, err := p.cfg.Provisioner.SettleAndRevoke(ctx, taskID, keyHash)
+	if err != nil {
+		p.logger.Printf("provisioner settle/revoke failed for task %s (%s): %v", taskID, state, err)
+		return
+	}
+	delta, bal, err := p.Settle(ctx, resource, taskID, actual)
+	if err != nil {
+		p.logger.Printf("ledger settle failed for task %s: %v", taskID, err)
+		return
+	}
+	p.logger.Printf("auto-settled provisioned task %s in %s on %s actual=%.6g delta=%+.6g balance=%.6g", taskID, resource, state, actual, delta, bal)
+}
+
+// releaseSynced closes an ended task's open reservation in every synced pool
+// and advertises once if any balance changed. The pool's external reading
+// already counts what the task spent, or will at the next read, so the
+// reservation is returned whole and no spend figure is needed. Unsynced pools
+// are left alone: their reservations stay open until /settle reports the
+// spend. The provisioner's pool is settled by settleProvisioned.
+func (p *Provider) releaseSynced(ctx context.Context, taskID, state string) {
+	var released []string
+	for _, name := range p.resources {
+		if p.cfg.Pools[name].Source == nil {
+			continue
+		}
+		if p.cfg.Provisioner != nil && name == p.cfg.ProvisionerResource {
+			continue
+		}
+		delta, bal, ok, err := p.ledger.ReleaseTask(name, taskID)
+		if err != nil {
+			p.logger.Printf("release of task %s in %s failed: %v", taskID, name, err)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		p.logger.Printf("released reservation of task %s in %s on %s amount=%.6g balance=%.6g", taskID, name, state, delta, bal)
+		if delta != 0 {
+			released = append(released, name)
+		}
+	}
+	if len(released) == 0 {
+		return
+	}
+	reason := fmt.Sprintf("released task %s in %s", taskID, strings.Join(released, ","))
+	if err := p.Advertise(ctx, reason); err != nil && ctx.Err() == nil {
+		p.logger.Printf("advertise error after release of task %s: %v", taskID, err)
 	}
 }
 

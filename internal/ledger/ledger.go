@@ -39,10 +39,13 @@ var (
 
 // TaskEntry records one task's reserved and settled consumable amount.
 // KeyHash is an optional opaque provider key identifier (never a raw secret).
+// Released marks a reservation closed by ReleaseTask: the ledger was not told
+// the task's spend, so Actual is zero and does not describe it.
 type TaskEntry struct {
 	Reserved float64 `json:"reserved"`
 	Settled  bool    `json:"settled"`
 	Actual   float64 `json:"actual,omitempty"`
+	Released bool    `json:"released,omitempty"`
 	KeyHash  string  `json:"key_hash,omitempty"`
 }
 
@@ -512,11 +515,41 @@ func (l *Ledger) SettleTask(resource, taskID string, actual float64) (float64, f
 	if entry.Settled {
 		return 0, pool.Balance, nil
 	}
+	return l.closeLocked(resource, taskID, entry, actual, false)
+}
+
+// ReleaseTask closes a task's open reservation in one pool without a spend
+// figure and returns the whole reservation, as SettleTask does for an actual
+// of zero. It is for a pool whose balance is reconciled against an external
+// reading: the task's spend reaches the ledger through the next reading, and
+// only the reservation has to stop being subtracted. A task with no entry in
+// the pool, or one already settled, is left as it is and released is false.
+// Returns (amountReleased, newBalance, released, err).
+func (l *Ledger) ReleaseTask(resource, taskID string) (float64, float64, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	pool, err := l.poolLocked(resource)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	entry, ok := pool.Tasks[taskID]
+	if !ok || entry.Settled {
+		return 0, pool.Balance, false, nil
+	}
+	delta, bal, err := l.closeLocked(resource, taskID, entry, 0, true)
+	return delta, bal, err == nil, err
+}
+
+// closeLocked marks an unsettled entry settled and applies reserved - actual
+// to the pool. Caller holds l.mu.
+func (l *Ledger) closeLocked(resource, taskID string, entry TaskEntry, actual float64, released bool) (float64, float64, error) {
+	prev := l.snap.Pools[resource].Balance
 	unused := round6(entry.Reserved - actual)
-	err = l.updateLocked(func(s *Snapshot) error {
+	err := l.updateLocked(func(s *Snapshot) error {
 		p := s.Pools[resource]
 		entry.Settled = true
 		entry.Actual = round6(actual)
+		entry.Released = released
 		p.Tasks[taskID] = entry
 		if unused < 0 {
 			// Overrun: deduct any extra actual spend beyond the reservation, floored at 0.
@@ -529,7 +562,7 @@ func (l *Ledger) SettleTask(resource, taskID string, actual float64) (float64, f
 		return nil
 	})
 	if err != nil {
-		return 0, pool.Balance, err
+		return 0, prev, err
 	}
 	l.settleSeq[resource]++
 	return unused, l.snap.Pools[resource].Balance, nil

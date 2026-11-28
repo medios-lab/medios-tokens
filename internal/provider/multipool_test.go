@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -356,6 +357,7 @@ func TestProvisionRecordsKeyHashInBoundPool(t *testing.T) {
 type quotaServer struct {
 	*httptest.Server
 	mu       sync.Mutex
+	cap      float64
 	used     float64
 	status   int
 	body     string // overrides the quota document when set
@@ -367,7 +369,7 @@ type quotaServer struct {
 const quotaToken = "tok-3f9a-do-not-log"
 
 func newQuotaServer() *quotaServer {
-	q := &quotaServer{status: http.StatusOK}
+	q := &quotaServer{status: http.StatusOK, cap: 1000}
 	q.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q.mu.Lock()
 		q.requests++
@@ -391,7 +393,7 @@ func newQuotaServer() *quotaServer {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"org": map[string]any{
-				"caps":  map[string]any{"org": map[string]any{"suggests_per_day": 1000}},
+				"caps":  map[string]any{"org": map[string]any{"suggests_per_day": q.cap}},
 				"usage": map[string]any{"suggests_24h": q.used},
 			},
 		})
@@ -705,4 +707,159 @@ func TestSyncPoolRetriesFailedAdvertise(t *testing.T) {
 	if got := accepted(); len(got) != 1 {
 		t.Fatalf("node accepted %d states after an unchanged reading, want 1", len(got))
 	}
+}
+
+func taskUpdated(taskID, state string) map[string]any {
+	return map[string]any{
+		"type": "TASK_UPDATED",
+		"task_updated": map[string]any{
+			"state": state,
+			"status": map[string]any{
+				"task_id": map[string]any{"value": taskID},
+				"state":   state,
+			},
+		},
+	}
+}
+
+// syncedHarness starts a provider with a synced pool (tau: cap 100, 38
+// available externally) and an unsynced one (usd: 50). The sync interval is
+// long enough that only the read before SUBSCRIBE happens during a test, so
+// every later balance change comes from task events and admin calls.
+func syncedHarness(t *testing.T, statePath string) (*harness, *ledger.Ledger, *quotaServer) {
+	t.Helper()
+	q := newQuotaServer()
+	t.Cleanup(q.Close)
+	q.set(func(q *quotaServer) { q.cap, q.used = 100, 62 })
+	l, err := ledger.OpenPools(statePath, []ledger.PoolSpec{
+		{Resource: tau, Initial: 100, Cap: 100},
+		{Resource: usd, Initial: 50, Cap: 50},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startHarness(t, l, Config{
+		Pools: map[string]PoolOptions{tau: {Source: q.poller(t), SyncInterval: time.Minute}},
+	}, io.Discard)
+	return h, l, q
+}
+
+func wantStates(t *testing.T, h *harness, want ...map[string]float64) {
+	t.Helper()
+	if got := h.waitStates(len(want)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("UPDATE_STATE sequence = %v, want %v", got, want)
+	}
+}
+
+func TestSyncedPoolReleasesReservationWhenTaskEnds(t *testing.T) {
+	for _, state := range []string{"TASK_FINISHED", "TASK_KILLED", "TASK_LOST"} {
+		t.Run(state, func(t *testing.T) {
+			h, l, q := syncedHarness(t, "")
+			h.events <- taskAdded("task-1", scalar(tau, 20), scalar(usd, 2))
+			// A non-terminal update changes nothing: the next UPDATE_STATE
+			// after the debit is the one the terminal update causes.
+			h.events <- taskUpdated("task-1", "TASK_RUNNING")
+			h.events <- taskUpdated("task-1", state)
+			wantStates(t, h,
+				map[string]float64{tau: 38, usd: 50},
+				map[string]float64{tau: 18, usd: 48},
+				map[string]float64{tau: 38, usd: 48},
+			)
+			if n, _ := q.seen(); n != 1 {
+				t.Fatalf("endpoint was read %d times, want 1: the release must not depend on a read", n)
+			}
+
+			snap := l.Snapshot()
+			if e := snap.Pools[tau].Tasks["task-1"]; !e.Settled || !e.Released || e.Actual != 0 {
+				t.Fatalf("synced pool entry = %+v, want settled and released", e)
+			}
+			// The unsynced pool's reservation stays open until /settle.
+			if e := snap.Pools[usd].Tasks["task-1"]; e.Settled || e.Reserved != 2 {
+				t.Fatalf("unsynced pool entry = %+v, want unsettled reservation of 2", e)
+			}
+
+			// A repeated terminal update releases nothing more.
+			h.events <- taskUpdated("task-1", state)
+			h.events <- taskAdded("task-2", scalar(tau, 1))
+			if got := h.waitStates(4); len(got) != 4 || !reflect.DeepEqual(got[3], map[string]float64{tau: 37, usd: 48}) {
+				t.Fatalf("UPDATE_STATE sequence after repeat = %v, want a fourth state with %s=37", got, tau)
+			}
+		})
+	}
+}
+
+func TestSettleAfterAutomaticReleaseChangesNothing(t *testing.T) {
+	h, l, _ := syncedHarness(t, "")
+	h.events <- taskAdded("task-1", scalar(tau, 20))
+	h.events <- taskUpdated("task-1", "TASK_FINISHED")
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 18, usd: 50},
+		map[string]float64{tau: 38, usd: 50},
+	)
+
+	code, body := h.post("/settle", fmt.Sprintf(`{"task_id":"task-1","actual":5,"resource":%q}`, tau))
+	if code != http.StatusOK || body["delta"] != 0.0 || body["balance"] != 38.0 {
+		t.Fatalf("/settle after release = HTTP %d %v, want 200 delta 0 balance 38", code, body)
+	}
+	if got := h.states(); len(got) != 3 {
+		t.Fatalf("/settle after release sent an UPDATE_STATE: %v", got)
+	}
+	if bal, _ := l.Balance(tau); bal != 38 {
+		t.Fatalf("balance = %v, want 38", bal)
+	}
+}
+
+func TestTerminalUpdateAfterSettleChangesNothing(t *testing.T) {
+	h, l, _ := syncedHarness(t, "")
+	h.events <- taskAdded("task-1", scalar(tau, 20))
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 18, usd: 50},
+	)
+
+	code, body := h.post("/settle", fmt.Sprintf(`{"task_id":"task-1","actual":5,"resource":%q}`, tau))
+	if code != http.StatusOK || body["delta"] != 15.0 || body["balance"] != 33.0 {
+		t.Fatalf("/settle = HTTP %d %v, want 200 delta 15 balance 33", code, body)
+	}
+
+	// The terminal update finds the task settled. The debit that follows it
+	// on the stream produces the next UPDATE_STATE, from 33 and not from 38.
+	h.events <- taskUpdated("task-1", "TASK_FINISHED")
+	h.events <- taskAdded("task-2", scalar(tau, 1))
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 18, usd: 50},
+		map[string]float64{tau: 33, usd: 50},
+		map[string]float64{tau: 32, usd: 50},
+	)
+	if e := l.Snapshot().Pools[tau].Tasks["task-1"]; e.Released || e.Actual != 5 {
+		t.Fatalf("entry = %+v, want the explicit settlement kept", e)
+	}
+}
+
+func TestReservationIsReleasedAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+
+	t.Run("reserve", func(t *testing.T) {
+		h, _, _ := syncedHarness(t, path)
+		h.events <- taskAdded("task-1", scalar(tau, 20))
+		wantStates(t, h,
+			map[string]float64{tau: 38, usd: 50},
+			map[string]float64{tau: 18, usd: 50},
+		)
+	})
+
+	// A new process loads the checkpoint. Its first read subtracts the
+	// reservation the checkpoint kept, and the terminal update releases it.
+	h, l, _ := syncedHarness(t, path)
+	if e := l.Snapshot().Pools[tau].Tasks["task-1"]; e.Settled || e.Reserved != 20 {
+		t.Fatalf("entry after restart = %+v, want unsettled reservation of 20", e)
+	}
+	wantStates(t, h, map[string]float64{tau: 18, usd: 50})
+	h.events <- taskUpdated("task-1", "TASK_FINISHED")
+	wantStates(t, h,
+		map[string]float64{tau: 18, usd: 50},
+		map[string]float64{tau: 38, usd: 50},
+	)
 }
