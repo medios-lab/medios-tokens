@@ -149,7 +149,7 @@ A synced pool closes a task's reservation when the task ends. On a terminal `TAS
 
 A `/settle` for the same task before or after the terminal event is accepted and is applied once: whichever arrives second changes nothing. An entry closed by a terminal event shows `"released": true` under `tasks` in `/balance`, with `actual` equal to the reservation because the ledger was not told the spend. Pools without `sync` are unchanged and keep a reservation open until `/settle` reports the spend.
 
-The provider does not see an event the controller sends while the provider is stopped or its controller stream is closed, and that task's reservation stays subtracted until a `/settle` for it.
+A task ending the provider did not receive an event for is picked up from the controller's task snapshot at the next subscription (see [Controller event stream](#controller-event-stream)).
 
 The advertised balance can be higher than the true one in two cases. If the endpoint reports a task's spend some time after the task ends, reads in between see the reservation gone and the spend not yet counted. Spend against the same external quota that did not pass through a task reservation is visible only after the next read.
 
@@ -158,6 +158,17 @@ When a read reports less than the unsettled reservations, the balance is zero an
 When a read fails (connection error, timeout, a status other than 200, or a response without the configured paths), the provider logs the failure and keeps advertising the last balance. There is no limit on how long it does so. The credential value is never written to the log or the state file.
 
 `POST /refill` on a synced pool returns HTTP 409.
+
+## Controller event stream
+
+Debits and task endings come from the controller's event stream (`POST /api/v1` `SUBSCRIBE`). When the stream ends or cannot be opened, the provider subscribes again after a wait that starts at 1 s and doubles after each attempt that fails to connect, up to 30 s, until the process stops. Each disconnect and each connection is logged.
+
+The controller starts every subscription with a snapshot of its tasks, and the provider uses it to cover events sent while no stream was open, including the time the provider itself was stopped:
+
+- A task the snapshot lists as launched and not ended is debited. The debit is once per task ID, so a task debited earlier is unchanged.
+- A debited, unsettled reservation whose task the snapshot lists as ended, or does not list, is handled like a terminal task event: closed in a synced pool, settled through the provisioner where one is configured, and left open for `/settle` in any other pool.
+
+A task that was both launched and ended while no stream was open is not debited. The provider does not time out a stream that stays open and delivers nothing.
 
 ## Per-task scoped keys for OpenRouter (Pattern 2)
 

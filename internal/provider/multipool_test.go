@@ -51,13 +51,18 @@ type harness struct {
 	admin  *httptest.Server
 	events chan map[string]any
 
+	// drop ends the controller stream that is currently open.
+	drop chan struct{}
+
 	mu         sync.Mutex
 	advertised []map[string]float64
+	connects   int            // controller subscriptions accepted
+	snapshot   map[string]any // SUBSCRIBED event sent at the start of each stream, if set
 }
 
 func startHarness(t *testing.T, l *ledger.Ledger, cfg Config, logOut io.Writer) *harness {
 	t.Helper()
-	h := &harness{t: t, events: make(chan map[string]any, 8)}
+	h := &harness{t: t, events: make(chan map[string]any, 8), drop: make(chan struct{})}
 	done := make(chan struct{})
 	ctrlReady := make(chan struct{})
 
@@ -89,11 +94,23 @@ func startHarness(t *testing.T, l *ledger.Ledger, cfg Config, logOut io.Writer) 
 		w.Header().Set("Content-Type", "application/json")
 		flusher := w.(http.Flusher)
 		flusher.Flush()
-		close(ctrlReady)
+		h.mu.Lock()
+		h.connects++
+		first := h.connects == 1
+		snapshot := h.snapshot
+		h.mu.Unlock()
+		if first {
+			close(ctrlReady)
+		}
+		if snapshot != nil {
+			writeRecord(w, flusher, snapshot)
+		}
 		for {
 			select {
 			case ev := <-h.events:
 				writeRecord(w, flusher, ev)
+			case <-h.drop:
+				return
 			case <-done:
 				return
 			}
@@ -106,6 +123,9 @@ func startHarness(t *testing.T, l *ledger.Ledger, cfg Config, logOut io.Writer) 
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Tests do not wait out the production resubscribe delays.
+	p.ctrlBackoffInitial = 10 * time.Millisecond
+	p.ctrlBackoffMax = 40 * time.Millisecond
 	h.p = p
 	h.admin = httptest.NewServer(p.AdminHandler())
 
@@ -895,4 +915,199 @@ func TestReservationIsClosedAfterRestart(t *testing.T) {
 		map[string]float64{tau: 18, usd: 50},
 		map[string]float64{tau: 30, usd: 50},
 	)
+}
+
+// snapshotTask is one Task of a controller snapshot.
+func snapshotTask(taskID, state string, resources ...map[string]any) map[string]any {
+	return map[string]any{
+		"task_id":   map[string]any{"value": taskID},
+		"state":     state,
+		"resources": resources,
+	}
+}
+
+func subscribed(tasks, completed []map[string]any) map[string]any {
+	return map[string]any{
+		"type": "SUBSCRIBED",
+		"subscribed": map[string]any{
+			"get_state": map[string]any{
+				"get_tasks": map[string]any{"tasks": tasks, "completed_tasks": completed},
+			},
+		},
+	}
+}
+
+func (h *harness) waitConnects(n int) {
+	h.t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		got := h.connects
+		h.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.t.Fatalf("controller saw fewer than %d subscriptions", n)
+}
+
+func TestControllerWatcherResubscribesAndAppliesSnapshot(t *testing.T) {
+	q := newQuotaServer()
+	defer q.Close()
+	q.set(func(q *quotaServer) { q.cap, q.used = 100, 62 })
+	l, err := ledger.OpenPools("", []ledger.PoolSpec{
+		{Resource: tau, Initial: 100, Cap: 100},
+		{Resource: usd, Initial: 50, Cap: 50},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	h := startHarness(t, l, Config{
+		Pools: map[string]PoolOptions{tau: {Source: q.poller(t), SyncInterval: time.Minute}},
+	}, logs)
+
+	// Three tasks are running when the stream goes down. task-b also holds
+	// the unsynced pool.
+	h.events <- taskAdded("task-a", scalar(tau, 20))
+	h.events <- taskAdded("task-b", scalar(tau, 5), scalar(usd, 2))
+	h.events <- taskAdded("task-c", scalar(tau, 3))
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 18, usd: 50},
+		map[string]float64{tau: 13, usd: 48},
+		map[string]float64{tau: 10, usd: 48},
+	)
+
+	// While it is down: task-a finishes, task-b disappears from the
+	// controller, task-c keeps running and task-d is launched.
+	h.mu.Lock()
+	h.snapshot = subscribed(
+		[]map[string]any{
+			snapshotTask("task-c", "TASK_RUNNING", scalar(tau, 3)),
+			snapshotTask("task-d", "TASK_RUNNING", scalar(tau, 2)),
+		},
+		[]map[string]any{
+			snapshotTask("task-a", "TASK_FINISHED", scalar(tau, 20)),
+			snapshotTask("task-old", "TASK_FINISHED", scalar(tau, 50)),
+		},
+	)
+	h.mu.Unlock()
+	h.drop <- struct{}{}
+	h.waitConnects(2)
+
+	// The snapshot debits task-d only: task-c is not debited again and the
+	// ended task-old, which the ledger never held, is not debited at all.
+	// A TASK_ADDED on the new stream is debited.
+	h.events <- taskAdded("task-e", scalar(tau, 1))
+	wantStates(t, h,
+		map[string]float64{tau: 38, usd: 50},
+		map[string]float64{tau: 18, usd: 50},
+		map[string]float64{tau: 13, usd: 48},
+		map[string]float64{tau: 10, usd: 48},
+		map[string]float64{tau: 8, usd: 48},
+		map[string]float64{tau: 7, usd: 48},
+	)
+
+	// The reservations of the ended and the absent task are settled as
+	// spent in the synced pool; the balance was not raised for them.
+	for _, id := range []string{"task-a", "task-b"} {
+		if e := waitClosed(t, l, id); !e.Released || e.Actual != e.Reserved {
+			t.Fatalf("%s entry = %+v, want released with actual = reserved", id, e)
+		}
+	}
+	snap := l.Snapshot()
+	for _, id := range []string{"task-c", "task-d", "task-e"} {
+		if e := snap.Pools[tau].Tasks[id]; e.Settled || e.Reserved == 0 {
+			t.Fatalf("%s entry = %+v, want an open reservation", id, e)
+		}
+	}
+	if _, ok := snap.Pools[tau].Tasks["task-old"]; ok {
+		t.Fatal("an ended task the ledger never held was debited from the snapshot")
+	}
+	// The unsynced pool still waits for /settle.
+	if e := snap.Pools[usd].Tasks["task-b"]; e.Settled || e.Reserved != 2 {
+		t.Fatalf("unsynced entry of task-b = %+v, want unsettled reservation of 2", e)
+	}
+
+	// The next read subtracts only the three open reservations: 30 - 6.
+	q.set(func(q *quotaServer) { q.used = 70 })
+	h.p.syncPool(context.Background(), tau, q.poller(t))
+	if got := h.waitStates(7)[6]; !reflect.DeepEqual(got, map[string]float64{tau: 24, usd: 48}) {
+		t.Fatalf("UPDATE_STATE after the next read = %v, want %s=24", got, tau)
+	}
+
+	out := logs.String()
+	for _, want := range []string{"controller event stream disconnected", "controller event stream connected"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestControllerWatcherRetriesUntilConnected(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	done := make(chan struct{})
+	ctrl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		if n <= 2 {
+			http.Error(w, "not leading", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		writeRecord(w, flusher, taskAdded("task-1", scalar(tau, 4)))
+		select {
+		case <-done:
+		case <-r.Context().Done():
+		}
+	}))
+	defer ctrl.Close()
+	defer close(done)
+
+	l := twoPoolLedger(t)
+	if err := l.SetProviderID("rp-test"); err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	p, err := New(Config{ControllerURL: ctrl.URL}, l, log.New(logs, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ctrlBackoffInitial = 5 * time.Millisecond
+	p.ctrlBackoffMax = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		p.runControllerWatcher(ctx)
+		close(stopped)
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if bal, _ := l.Balance(tau); bal == 996 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task on the third subscription was not debited; log:\n%s", logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := strings.Count(logs.String(), "controller event stream not connected"); got != 2 {
+		t.Fatalf("logged %d failed subscriptions, want 2:\n%s", got, logs.String())
+	}
+
+	// Cancelling the context ends the watcher.
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("watcher did not stop after its context was cancelled")
+	}
 }
